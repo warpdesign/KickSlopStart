@@ -29,7 +29,6 @@ Roadmap → `docs/PLAN.md`. Architecture → `docs/ARCHITECTURE.md`. Discipline 
   their English version.
 - Never translate **string literals** in code (displayed text, serial markers, script output parsed by harnesses).
 - Analysis agents write their specs in English; tell them so in every brief.
-- Conversation with the user stays in French.
 
 ## Build / test (reference)
 
