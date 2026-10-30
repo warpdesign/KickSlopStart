@@ -590,6 +590,14 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
     Workbench then walked the freed old list (a node reused as a RegionRectangle -> bitmap pointer = bounds 639, 69 ->
     address error in RectFill). The lock is now taken first. Reproduced deterministically with Workbench
     double-clicks (tests/dskchg_run.sh), fixed: no failure over 9 launches.
+  (7i) **Selected icon: alternate image** (2026-10-30, GitHub issue #7 "small graphics glitches"). A selected drawer
+  showed an orange inverted box where 1.3 shows the drawer pulled open. `wb_hilite` (`src/dos/workbench.s`,
+  replaces `wb_invert`) follows the DiskObject's gadget highlighting (RKRM / intuition.h): `GADGHIMAGE` with a
+  `SelectRender` -> the image of the current state (SelectRender selected, GadgetRender otherwise) is drawn over the
+  other one; any other mode (WB 1.3.3: Disk, Shell = mode 1, `GADGBACKFILL`) or a NULL SelectRender (built-in default
+  icons) keeps the COMPLEMENT of the icon rectangle. On the WB 1.3.3 disk the drawers and the Trashcan are
+  `GADGHIMAGE`. Verified in Copperline against the official ROM run as a black box: Empty (open drawer), Trashcan
+  (lid lifted), Shell (complemented) and deselection identical.
   (7g) **Polygon and ellipse fills, Flood, Amiga-key cat** (2026-10-28; spec
   `docs/analysis/graphics-area-v34.md`).
   - graphics (`src/graphics/area.s`): InitArea (−282), InitTmpRas (−468), AreaMove/AreaDraw/AreaEnd (−252..−264),

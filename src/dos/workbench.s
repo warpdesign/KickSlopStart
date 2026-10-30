@@ -11,8 +11,8 @@
 ; on DISKINSERTED / DISKREMOVED; a volume gone from the DosList loses its icon. Drawer windows (WB_MAXDRAWERS): the
 ; root (double-click on the disk) and any nested drawer (double-click on a drawer icon), icons read through
 ; Examine/ExNext + GetDiskObject, redrawn on REFRESHWINDOW (BeginRefresh/EndRefresh). Only one icon selected at a
-; time (inverted rectangle). Double-click on a tool: launched by CreateProc with a WBStartup message (argument 0 =
-; the tool); on a project: its default tool, the project as argument 1. The message comes back on the "Workbench"
+; time (alternate image if GADGHIMAGE, else inverted rectangle). Double-click on a tool: launched by CreateProc
+; with a WBStartup message (argument 0 = the tool); on a project: its default tool, the project as argument 1. The message comes back on the "Workbench"
 ; port when the tool ends: segment unloaded, locks returned. Workbench / Disk / Special menus: Open, Close, Rename,
 ; Discard, Clean Up, Last Error, Redraw, Snapshot and Version active, the rest ghosted. Screen title (spec §6): free
 ; memory on the 5 s tick, frozen message (Version, Last Error) until the next click or menu. Scope: a single selected
@@ -1585,7 +1585,7 @@ wb_iconrect:
         moveq   #0,d0                ; Z = 1
         rts
 
-; wb_drawwin(d7.w = window, a5): draws its icons (and the name of each one below it); the selection is re-inverted.
+; wb_drawwin(d7.w = window, a5): draws its icons (and the name of each one below it); the selection is highlighted again.
 ; Preserves d2-d7/a2-a6.
 wb_drawwin:
         movem.l d2-d7/a2-a4/a6,-(sp)
@@ -1803,7 +1803,7 @@ wb_repair:
         rts
 
 ; wb_drawicon(a2 = DiskObject, a3 = window, a4 = name, d4/d5 = position, d6.w = number, d7.w = window, a5): image of
-; the icon, name centred below it (pen 2, JAM1), inverted if selected. Preserves d2-d7/a2-a4.
+; the icon, name centred below it (pen 2, JAM1), highlighted if selected (wb_hilite). Preserves d2-d7/a2-a4.
 wb_drawicon:
         movem.l d2-d7/a2-a4,-(sp)
         move.l  WBS_IBASE(a5),a6
@@ -1844,22 +1844,44 @@ wb_drawicon:
         cmp.w   WBS_SELI(a5),d6
         bne.s   .di_ret
         move.w  d6,d1
-        bsr     wb_invert
+        bsr     wb_hilite
 .di_ret:
         movem.l (sp)+,d2-d7/a2-a4
         rts
 
-; wb_invert(d7.w = window, d1.w = icon, a5): inverts (COMPLEMENT) the rectangle of the icon. Preserves d2-d7/a2-a5.
-wb_invert:
-        movem.l d2-d3/a2-a4/a6,-(sp)
-        move.w  d1,-(sp)
+; wb_hilite(d7.w = window, d1.w = icon, a5): shows the selection state of the icon (WBS_SELW/WBS_SELI). GADGHIMAGE
+; with a SelectRender: the image of that state is drawn over the other one (RKRM: alternate image); otherwise the
+; rectangle of the icon is inverted (COMPLEMENT, hence a toggle). Preserves d2-d7/a2-a5.
+wb_hilite:
+        movem.l d2-d4/a2-a4/a6,-(sp)
+        move.w  d1,d4
         moveq   #1,d0
         bsr     wb_updopen
-        move.w  (sp)+,d1
+        move.w  d4,d1
         bsr     wb_iconrect
         beq.s   .iv_end
         movem.w d0-d3,-(sp)
         bsr     wb_window
+        moveq   #GADGHIGHBITS,d0
+        and.w   DO_GADGET+GG_FLAGS(a2),d0
+        cmp.w   #GADGHIMAGE,d0
+        bne.s   .iv_comp
+        move.l  DO_GADGET+GG_SELECTRENDER(a2),d0
+        beq.s   .iv_comp
+        move.l  d0,a1
+        cmp.w   WBS_SELW(a5),d7
+        bne.s   .iv_norm
+        cmp.w   WBS_SELI(a5),d4
+        beq.s   .iv_img
+.iv_norm:
+        move.l  DO_GADGET+GG_GADGETRENDER(a2),a1
+.iv_img:
+        movem.w (sp)+,d0-d3
+        move.l  WD_RPORT(a3),a0
+        move.l  WBS_IBASE(a5),a6
+        jsr     LVO_DRAWIMAGE(a6)
+        bra.s   .iv_end
+.iv_comp:
         move.l  WBS_GFXBASE(a5),a6
         move.l  WD_RPORT(a3),a1
         moveq   #COMPLEMENT,d0
@@ -1872,7 +1894,7 @@ wb_invert:
         jsr     LVO_SETDRMD(a6)
 .iv_end:
         bsr     wb_updclose
-        movem.l (sp)+,d2-d3/a2-a4/a6
+        movem.l (sp)+,d2-d4/a2-a4/a6
         rts
 
 ; wb_click(d7.w = window, d4/d5 = mouse in the window, d6/a0 = timestamp, a5): on an icon -> selection (the
@@ -1935,7 +1957,7 @@ wb_click:
         move.l  (sp),d1
         move.w  d7,WBS_SELW(a5)
         move.w  d1,WBS_SELI(a5)
-        bsr     wb_invert
+        bsr     wb_hilite
         move.l  (sp)+,d1
 .ck_drag:
         bsr     wb_dragstart         ; the icon can be dragged as long as the button stays pressed
@@ -2191,7 +2213,7 @@ wb_deselect:
         move.w  d0,d7
         move.w  WBS_SELI(a5),d1
         move.w  #-1,WBS_SELW(a5)
-        bsr     wb_invert
+        bsr     wb_hilite
         move.l  (sp)+,d7
 .ds_ret:
         rts
