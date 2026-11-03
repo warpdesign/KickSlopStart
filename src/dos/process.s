@@ -13,25 +13,36 @@
 
                 xdef    proc_create
                 xdef    dos_sendpkt
+                xdef    dos_waitreply
                 xref    dos_pktretry         ; dos/dos_lib.s
                 xref    task_alloc           ; exec/tasks.s
 
 ; proc_create(a6=SysBase, a0=name, a1=entryPC, d0=priority.b, d1=stack size) -> d0 = APTR &pr_MsgPort | 0.
+; The name is copied (31 characters at most) after the Process, in the same tc_MemEntry block (PRX_*, dospkt.i).
+; pr_StackSize = d1 (Directory Opus's CreateProc child refuses to run below 16384).
 proc_create:
                 movem.l d2-d4/a2-a4,-(sp)
                 move.l  a0,a2                ; a2 = name
                 move.l  a1,a3                ; a3 = entryPC (process body)
                 move.b  d0,d3                ; d3 = priority
                 move.l  d1,d4                ; d4 = stack size
+                move.l  d1,d2                ; d2 = pr_StackSize as asked (1.3 does not round it, dos-v34-spec §4a)
                 addq.l  #7,d4
                 and.w   #-8,d4
-                move.l  #PR_SIZEOF,d0        ; Process + stack described in tc_MemEntry (RemTask will free them)
+                move.l  #PRX_SIZE,d0         ; Process + name + segarray room + stack in tc_MemEntry (RemTask frees them)
                 move.l  d4,d1
                 jsr     task_alloc
                 tst.l   d0
                 beq     .fail
                 move.l  d0,a4                ; a4 = Process (= base Task)
-                move.l  a2,LN_NAME(a4)
+                lea     PRX_NAME(a4),a0
+                move.l  a0,LN_NAME(a4)
+                move.l  d2,PR_STACKSIZE(a4)
+                moveq   #PRX_NAMEMAX-2,d0
+.name:
+                move.b  (a2)+,(a0)+
+                dbeq    d0,.name
+                clr.b   (a0)
                 move.b  d3,LN_PRI(a4)
                 move.b  #NT_PROCESS,LN_TYPE(a4)
                 move.l  #SYS_SIGALLOC,TC_SIGALLOC(a4)   ; bits 0-15 reserved (including DOS_PORTSIG=8)
@@ -76,6 +87,53 @@ proc_exit:
                 jsr     LVO_WAIT(a6)
                 bra.s   .pe
 
+; dos_waitreply(a0 = port, a1 = our message, a6 = SysBase): waits until our message comes back on the port. The
+; process port also receives other messages (replies of IORequests a BCPL handler sent with that port, packets for
+; it): they are taken out meanwhile and put back afterwards, in order, with their type (a replied IORequest must stay
+; NT_REPLYMSG for CheckIO/WaitIO). Clobbers d0/d1/a0/a1.
+dos_waitreply:
+                movem.l d2-d5/a2-a3,-(sp)
+                move.l  a0,a2                ; a2 = port
+                move.l  a1,a3                ; a3 = awaited message
+                moveq   #0,d2                ; d2/d3 = head/tail of the messages put aside
+                moveq   #0,d3
+.wr_lp:
+                move.l  a2,a0
+                jsr     LVO_WAITPORT(a6)
+                move.l  a2,a0
+                jsr     LVO_GETMSG(a6)
+                tst.l   d0
+                beq.s   .wr_lp
+                cmp.l   a3,d0
+                beq.s   .wr_back
+                move.l  d0,a0
+                clr.l   LN_SUCC(a0)
+                tst.l   d3
+                beq.s   .wr_first
+                move.l  d3,a1
+                move.l  a0,LN_SUCC(a1)
+                bra.s   .wr_tail
+.wr_first:
+                move.l  a0,d2
+.wr_tail:
+                move.l  a0,d3
+                bra.s   .wr_lp
+.wr_back:
+                tst.l   d2
+                beq.s   .wr_ret
+                move.l  d2,a1
+                move.l  a1,d5
+                move.l  LN_SUCC(a1),d2
+                move.b  LN_TYPE(a1),d4       ; PutMsg makes it NT_MESSAGE
+                move.l  a2,a0
+                jsr     LVO_PUTMSG(a6)
+                move.l  d5,a1
+                move.b  d4,LN_TYPE(a1)       ; the port is ours: nobody takes the message meanwhile
+                bra.s   .wr_back
+.wr_ret:
+                movem.l (sp)+,d2-d5/a2-a3
+                rts
+
 ; dos_sendpkt(a6=SysBase, a0=StandardPacket, a1=handler port, d0=dp_Type, d1=arg1, d2=arg2, d3=arg3, d4=arg4)
 ;   -> d0 = dp_Res1, d1 = dp_Res2. No public DoPkt in V34 -> this internal equivalent sets up the packet, PutMsg to
 ;   the handler, then WaitPort/GetMsg on the CALLER's pr_MsgPort (which MUST be a Process). dos convention:
@@ -117,10 +175,9 @@ dos_sendpkt:
                 move.l  a3,a0                ; PutMsg(handlerPort, &sp_Msg)
                 move.l  a2,a1
                 jsr     LVO_PUTMSG(a6)
-                move.l  a5,a0                ; WaitPort(reply) -> synchronous switch to the handler
-                jsr     LVO_WAITPORT(a6)
-                move.l  a5,a0
-                jsr     LVO_GETMSG(a6)       ; fetch our packet (replied by the handler)
+                move.l  a5,a0                ; our packet back (other messages on the port stay queued)
+                move.l  a2,a1
+                bsr     dos_waitreply
                 move.l  DP_RES1(a4),d0
                 move.l  DP_RES2(a4),d1
                 jsr     dos_pktretry         ; volume ejected: "Please replace volume", Retry -> resend

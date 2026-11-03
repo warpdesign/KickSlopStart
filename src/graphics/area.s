@@ -24,6 +24,7 @@
                 xdef    gfx_AreaEnd
                 xdef    gfx_DrawEllipse
                 xdef    gfx_Flood
+                xdef    gfx_BltPattern
 
 AREAOUTLINE     EQU $0008
 ai_VctrTbl      EQU 0
@@ -37,6 +38,7 @@ ai_FirstY       EQU 22
 tr_RasPtr       EQU 0
 tr_Size         EQU 4
 LY_BOUNDS       EQU 16               ; Layer.bounds: MinX, MinY, MaxX, MaxY
+LY_LOCK         EQU 72               ; Layer.Lock (SignalSemaphore)
 LVO_READPIXEL   EQU -318
 LVO_WRITEPIXEL  EQU -324
 LVO_AREADRAW    EQU -258
@@ -423,7 +425,8 @@ MK_CX           EQU 22               ; word: ellipse centre (callbacks)
 MK_CY           EQU 24
 MK_TBL          EQU 26               ; long: table of an ellipse's half-widths
 MK_FLAGS        EQU 30               ; word: saved rp_Flags
-MK_SIZE         EQU 32
+MK_COLS         EQU 32               ; word: columns rendered by mk_render
+MK_SIZE         EQU 34
 
 ; mk_bit(d0 = x, d1 = y absolute, a5): applies MK_OP to the point (outside the mask: nothing). Clobbers d0/d1/a0.
 mk_bit:
@@ -519,6 +522,10 @@ mk_alloc:
         lsr.w   #4,d0
         add.w   d0,d0
         move.w  d0,MK_L(a5)
+        move.w  d0,MK_COLS(a5)
+        lsl.w   MK_COLS(a5)          ; x 8: columns
+        lsl.w   MK_COLS(a5)
+        lsl.w   MK_COLS(a5)
         move.w  d1,MK_H(a5)
         mulu    d0,d1
         clr.l   MK_ALLOC(a5)
@@ -583,8 +590,7 @@ mk_render:
         bge.s   .mr_end
         moveq   #-1,d5               ; d5 = start of the current run (-1: none)
         moveq   #0,d6                ; d6 = column
-        move.w  MK_L(a5),d4
-        lsl.w   #3,d4                ; d4 = columns
+        move.w  MK_COLS(a5),d4       ; d4 = columns
 .mr_col:
         cmp.w   d4,d6
         bge.s   .mr_eol
@@ -639,6 +645,48 @@ mk_render:
         move.l  MK_RP(a5),a1
         jsr     LVO_RECTFILL(a6)
         movem.l (sp)+,d2-d7/a2
+        rts
+
+; ---------------------------------------------------------------------------------------------------------------
+; BltPattern(rp a1, mask a0, xl d0, yl d1, maxX d2, maxY d3, bytecnt d4), inclusive bounds (spec graphics-blitter
+; §8): RectFill's pens, mode, pattern and layer clipping, without the AREAOUTLINE outline. mask NULL: the whole
+; rectangle; otherwise only the pixels whose mask bit is set (bit 7 of the first byte of a row = column xl, rows
+; bytecnt bytes apart). CPU rendering like the rest of this file.
+gfx_BltPattern:
+        movem.l d2-d4/a5,-(sp)
+        lea     -MK_SIZE(sp),sp
+        move.l  sp,a5
+        move.l  a1,MK_RP(a5)
+        cmpa.w  #0,a0
+        bne.s   .bp_mask
+        move.w  rp_Flags(a1),MK_FLAGS(a5)
+        and.w   #~AREAOUTLINE,rp_Flags(a1)
+        jsr     LVO_RECTFILL(a6)
+        move.l  MK_RP(a5),a1
+        move.w  MK_FLAGS(a5),rp_Flags(a1)
+        bra.s   .bp_ret
+.bp_mask:
+        move.l  a0,MK_BUF(a5)
+        move.w  d0,MK_X0(a5)
+        move.w  d1,MK_Y0(a5)
+        move.w  d4,MK_L(a5)
+        sub.w   d1,d3
+        addq.w  #1,d3
+        ble.s   .bp_ret
+        move.w  d3,MK_H(a5)
+        sub.w   d0,d2
+        addq.w  #1,d2
+        ble.s   .bp_ret
+        lsl.w   #3,d4                ; never past the end of a mask row
+        cmp.w   d4,d2
+        ble.s   .bp_cols
+        move.w  d4,d2
+.bp_cols:
+        move.w  d2,MK_COLS(a5)
+        bsr     mk_render
+.bp_ret:
+        lea     MK_SIZE(sp),sp
+        movem.l (sp)+,d2-d4/a5
         rts
 
 ; ---------------------------------------------------------------------------------------------------------------
@@ -1049,12 +1097,14 @@ FL_W            EQU MK_SIZE+4        ; word: width of the area
 FL_SP           EQU MK_SIZE+6        ; long: top of the seed stack
 FL_STKB         EQU MK_SIZE+10       ; long: base of the stack
 FL_OVF          EQU MK_SIZE+14       ; word: stack overflowed
-FL_SIZE         EQU MK_SIZE+16
+FL_LAYER        EQU MK_SIZE+16       ; long: layer locked for the whole Flood (spec §7.1) | 0
+FL_SIZE         EQU MK_SIZE+20
 gfx_Flood:
         movem.l d2-d7/a2-a5,-(sp)
         lea     -FL_SIZE(sp),sp
         move.l  sp,a5
         move.l  a1,MK_RP(a5)
+        clr.l   FL_LAYER(a5)
         move.w  d2,FL_MODE(a5)
         move.w  d0,d6                ; seed
         move.w  d1,d7
@@ -1067,6 +1117,13 @@ gfx_Flood:
         clr.w   MK_Y0(a5)
         move.l  rp_Layer(a1),d0
         beq.s   .fl_bm
+        move.l  d0,FL_LAYER(a5)      ; the layer stays locked until the end: its bounds and contents are stable
+        movem.l d0/a1/a6,-(sp)
+        move.l  d0,a0
+        lea     LY_LOCK(a0),a0
+        move.l  ($4).w,a6
+        jsr     LVO_OBTAINSEMAPHORE(a6)
+        movem.l (sp)+,d0/a1/a6
         move.l  d0,a0
         move.w  LY_BOUNDS+4(a0),d0
         sub.w   LY_BOUNDS(a0),d0
@@ -1088,6 +1145,10 @@ gfx_Flood:
         lsr.w   #4,d0
         add.w   d0,d0
         move.w  d0,MK_L(a5)
+        move.w  d0,MK_COLS(a5)
+        lsl.w   MK_COLS(a5)          ; x 8: columns
+        lsl.w   MK_COLS(a5)
+        lsl.w   MK_COLS(a5)
         move.w  d1,MK_H(a5)
         mulu    d1,d0
         move.l  d0,d3
@@ -1152,6 +1213,15 @@ gfx_Flood:
 .fl_fail:
         moveq   #0,d0
 .fl_ret:
+        move.l  FL_LAYER(a5),d1
+        beq.s   .fl_nolk
+        movem.l d0/a6,-(sp)
+        move.l  d1,a0
+        lea     LY_LOCK(a0),a0
+        move.l  ($4).w,a6
+        jsr     LVO_RELEASESEMAPHORE(a6)
+        movem.l (sp)+,d0/a6
+.fl_nolk:
         lea     FL_SIZE(sp),sp
         movem.l (sp)+,d2-d7/a2-a5
         rts

@@ -198,11 +198,13 @@ pf_keyrpt:
         move.l  IB_PREFS+PF_KEYRPTDELAY(a3),TV_SECS(a2)
         move.l  IB_PREFS+PF_KEYRPTDELAY+4(a3),TV_MICRO(a2)
         move.l  a2,a1
+        move.b  #IOF_QUICK,IO_FLAGS(a1)
         jsr     TD_BEGINIO(a6)
         move.w  #IND_SETPERIOD,IO_COMMAND(a2)
         move.l  IB_PREFS+PF_KEYRPTSPEED(a3),TV_SECS(a2)
         move.l  IB_PREFS+PF_KEYRPTSPEED+4(a3),TV_MICRO(a2)
         move.l  a2,a1
+        move.b  #IOF_QUICK,IO_FLAGS(a1)
         jsr     TD_BEGINIO(a6)
         lea     TR_SIZE(sp),sp
 .kr_ret:
@@ -290,7 +292,7 @@ pf_defaults:
         dc.l    1,500000                 ; DoubleClick
         dcb.w   36,0                     ; PointerMatrix (image filled in by GetDefPrefs)
         dc.b    0,0                      ; XOffset, YOffset
-        dc.w    $0E44,$0000,$0EEC        ; color17..19 (pointer)
+        dc.w    $0517,$0000,$0EEC        ; color17..19 (pointer): dark purple fill, a deliberate difference
         dc.w    2                        ; PointerTicks
         dc.w    SC_BGCOLOR,$0FFF,$0000,$0F80 ; color0..3 (Workbench)
         dc.b    0,0                      ; ViewXOffset, ViewYOffset

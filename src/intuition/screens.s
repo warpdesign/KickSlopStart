@@ -30,8 +30,18 @@
                 xdef    intuition_RemakeDisplay
                 xdef    intuition_ScreenToFront
                 xdef    intuition_ScreenToBack
+                xdef    intuition_CloseWorkBench
+                xdef    intuition_WBenchToFront
+                xdef    intuition_WBenchToBack
+                xdef    intuition_MoveScreen
+                xdef    intuition_MakeScreen
+                xdef    intuition_ActivateWindow
+                xdef    intuition_RefreshWindowFrame
+                xdef    intuition_CurrentTime
+                xref    it_ptrapply          ; pointer.s
                 xdef    it_event
                 xdef    it_refresh           ; menus.s
+                xdef    it_alive             ; menus.s
                 xdef    it_title
                 xdef    it_box
                 xdef    it_scrxy
@@ -96,7 +106,9 @@ WD_TBARH        EQU 10               ; height of a window's title bar (BorderTop
 
 ; OpenScreen(newscreen a0) -> d0 = Screen | 0. Allocates the struct, the BitMap (cleared chip planes, except
 ; CUSTOMBITMAP), the default palette (32 colors, including those of the pointer), draws the title bar (except
-; SCREENQUIET), places the screen at the head of the list and displays it.
+; SCREENQUIET), places the screen at the head of the list and displays it. SCREENBEHIND: at the tail of the list,
+; so it stays hidden until it is brought to the front (programs draw it, set its colours, then ScreenToFront), and
+; ActiveScreen is left alone (intuition-screens-v34 §2.1 step 21, intuition-screenbehind-v34).
 intuition_OpenScreen:
         movem.l d2-d7/a2-a5,-(sp)
         move.l  a6,a5                ; a5 = IntuitionBase
@@ -117,9 +129,13 @@ intuition_OpenScreen:
         bpl.s   .os_wok
         move.w  #640,d4
 .os_wok:
-        move.w  NS_HEIGHT(a2),d5     ; d5 = height (<= 0: 256, PAL)
-        bgt.s   .os_hok
-        move.w  #256,d5
+        move.w  NS_HEIGHT(a2),d5     ; d5 = height (<= 0: the display height, NormalDisplayRows: 256 PAL, 200 NTSC,
+        bgt.s   .os_hok              ; doubled with LACE — intuition-screens-v34 §2.2)
+        move.l  IB_GFXBASE(a5),a0
+        move.w  gb_NormalDisplayRows(a0),d5
+        btst    #2,NS_VIEWMODES+1(a2) ; LACE ($0004)
+        beq.s   .os_hok
+        add.w   d5,d5
 .os_hok:
         move.w  d4,SC_WIDTH(a3)
         move.w  d5,SC_HEIGHT(a3)
@@ -240,9 +256,23 @@ intuition_OpenScreen:
 .os_quiet:
         move.l  ($4).w,a6
         jsr     LVO_FORBID(a6)
+        move.w  SC_FLAGS(a3),d0
+        and.w   #SCREENBEHIND,d0
+        beq.s   .os_front
+        lea     IB_FIRSTSCREEN(a5),a0 ; previous link (SC_NEXTSCREEN at offset 0); SC_NEXTSCREEN(a3) is 0
+.os_tail:
+        move.l  (a0),d0
+        beq.s   .os_link
+        move.l  d0,a0
+        bra.s   .os_tail
+.os_link:
+        move.l  a3,(a0)
+        bra.s   .os_linked
+.os_front:
         move.l  IB_FIRSTSCREEN(a5),SC_NEXTSCREEN(a3)
         move.l  a3,IB_FIRSTSCREEN(a5)
         move.l  a3,IB_ACTIVESCREEN(a5)
+.os_linked:
         jsr     LVO_PERMIT(a6)
         bsr     it_remake
         move.l  a3,d0
@@ -597,14 +627,173 @@ intuition_CloseScreen:
         movem.l (sp)+,d3/a3-a5
         rts
 
-; OpenWorkBench() -> d0 = Workbench Screen: opens it if it is not open (640x256, 2 planes, HIRES).
+; OpenWorkBench() -> d0 = Workbench Screen: opens it if it is not open (640 x display height, 2 planes, HIRES).
 intuition_OpenWorkBench:
         move.l  IB_WBSCREEN(a6),d0
         bne.s   .ow_ret
         lea     sc_wbnewscreen(pc),a0
         bsr     intuition_OpenScreen
         move.l  d0,IB_WBSCREEN(a6)
+        beq.s   .ow_ret
+        move.l  d0,-(sp)
+        moveq   #1,d0                ; WBENCHOPEN to a registered Workbench
+        bsr     it_wbmsg
+        move.l  (sp)+,d0
 .ow_ret:
+        rts
+
+; CloseWorkBench() -> d0 = TRUE | FALSE (spec intuition-screens §6.2): FALSE without a Workbench screen or if a window
+; on it is not a Workbench window; otherwise WBENCHCLOSE to a registered Workbench (synchronous), then the screen is
+; closed (even if windows remain) and TRUE.
+intuition_CloseWorkBench:
+        move.l  IB_WBSCREEN(a6),d0
+        beq.s   .cwb_no
+        move.l  d0,a0
+        move.l  SC_FIRSTWINDOW(a0),d0
+.cwb_win:
+        beq.s   .cwb_ok
+        move.l  d0,a1
+        move.l  WD_FLAGS(a1),d1
+        and.l   #WBENCHWINDOW,d1
+        beq.s   .cwb_no
+        move.l  WD_NEXTWINDOW(a1),d0
+        bra.s   .cwb_win
+.cwb_ok:
+        moveq   #2,d0                ; WBENCHCLOSE
+        bsr     it_wbmsg
+        move.l  IB_WBSCREEN(a6),d0
+        beq.s   .cwb_no              ; closed meanwhile by the Workbench
+        move.l  d0,a0
+        bsr     intuition_CloseScreen
+        moveq   #1,d0
+        rts
+.cwb_no:
+        moveq   #0,d0
+        rts
+
+; it_wbmsg(code d0, a6 = IntuitionBase): WBENCHMESSAGE (Code 1 = WBENCHOPEN, 2 = WBENCHCLOSE) to the port registered by
+; AlohaWorkbench, then waits for the reply on the public "WBenchPort" (created at the first message, kept). Nothing if
+; no Workbench is registered. Preserves everything but d0/d1/a0/a1.
+it_wbmsg:
+        tst.l   IB_WBPORT(a6)
+        beq     .wm_ret
+        movem.l d2/a2/a5-a6,-(sp)
+        move.l  a6,a5
+        move.w  d0,d2
+        move.l  ($4).w,a6
+        move.l  IB_WBRPORT(a5),d0
+        bne.s   .wm_port
+        moveq   #MP_SIZE,d0
+        move.l  #(MEMF_PUBLIC|MEMF_CLEAR),d1
+        jsr     LVO_ALLOCMEM(a6)
+        tst.l   d0
+        beq     .wm_out
+        move.l  d0,a1
+        move.b  #NT_MSGPORT,LN_TYPE(a1)
+        lea     it_wbpname(pc),a0
+        move.l  a0,LN_NAME(a1)
+        lea     MP_MSGLIST+4(a1),a0  ; empty list: head -> &tail, tailpred -> &head
+        move.l  a0,MP_MSGLIST(a1)
+        lea     MP_MSGLIST(a1),a0
+        move.l  a0,MP_MSGLIST+8(a1)
+        move.l  a1,IB_WBRPORT(a5)
+        jsr     LVO_ADDPORT(a6)
+        move.l  IB_WBRPORT(a5),d0
+.wm_port:
+        move.l  d0,a2
+        moveq   #-1,d0
+        jsr     LVO_ALLOCSIGNAL(a6)
+        move.b  d0,MP_SIGBIT(a2)
+        sub.l   a1,a1
+        jsr     LVO_FINDTASK(a6)
+        move.l  d0,MP_SIGTASK(a2)
+        lea     IB_WBMSG(a5),a1
+        move.b  #NT_MESSAGE,LN_TYPE(a1)
+        move.l  a2,MN_REPLYPORT(a1)
+        move.w  #IM_SIZEOF,MN_LENGTH(a1)
+        move.l  #WBENCHMESSAGE,IM_CLASS(a1)
+        move.w  d2,IM_CODE(a1)
+        move.l  IB_WBPORT(a5),a0
+        jsr     LVO_PUTMSG(a6)
+        moveq   #0,d0
+        move.b  MP_SIGBIT(a2),d1
+        bset    d1,d0
+        jsr     LVO_WAIT(a6)
+        move.l  a2,a0
+        jsr     LVO_GETMSG(a6)
+        moveq   #0,d0
+        move.b  MP_SIGBIT(a2),d0
+        jsr     LVO_FREESIGNAL(a6)
+.wm_out:
+        movem.l (sp)+,d2/a2/a5-a6
+.wm_ret:
+        rts
+it_wbpname:
+        dc.b    "WBenchPort",0
+        even
+
+; WBenchToFront() / WBenchToBack() -> d0 = TRUE | FALSE: ScreenToFront / ScreenToBack of the Workbench screen.
+intuition_WBenchToFront:
+        moveq   #0,d1
+        bra.s   wb_depth
+intuition_WBenchToBack:
+        moveq   #1,d1
+wb_depth:
+        move.l  IB_WBSCREEN(a6),d0
+        beq.s   .wd_ret
+        move.l  d0,a0
+        bsr     sc_depth
+        moveq   #1,d0
+.wd_ret:
+        rts
+
+; MoveScreen(screen a0, dx d0, dy d1) (spec intuition-screens §8.2): dx ignored; TopEdge += dy if the result is >= 0,
+; otherwise 0 if TopEdge > 0, otherwise nothing; ViewPort DyOffset := TopEdge; display rebuilt. Deviation: only the
+; front screen is displayed, at the top of the display.
+intuition_MoveScreen:
+        move.w  SC_TOPEDGE(a0),d0
+        add.w   d1,d0
+        bpl.s   .ms_set
+        tst.w   SC_TOPEDGE(a0)
+        ble.s   .ms_ret
+        moveq   #0,d0
+.ms_set:
+        move.w  d0,SC_TOPEDGE(a0)
+        move.w  d0,SC_VIEWPORT+vp_DyOffset(a0)
+        bra     intuition_RemakeDisplay
+.ms_ret:
+        rts
+
+; MakeScreen(screen a0): MakeVPort of the screen's ViewPort in intuition's View; neither MrgCop nor LoadView (the
+; caller then calls RethinkDisplay).
+intuition_MakeScreen:
+        move.l  a6,-(sp)
+        lea     SC_VIEWPORT(a0),a1
+        lea     IB_VIEWLORD(a6),a0
+        move.l  IB_GFXBASE(a6),a6
+        jsr     LVO_MAKEVPORT(a6)
+        move.l  (sp)+,a6
+        rts
+
+; ActivateWindow(window a0): the window becomes the active window (frame and pointer), if it is still open.
+intuition_ActivateWindow:
+        movem.l a3/a5,-(sp)
+        move.l  a6,a5
+        move.l  a0,a3
+        bsr     it_alive
+        beq.s   .aw_ret
+        bsr     it_setactive
+.aw_ret:
+        movem.l (sp)+,a3/a5
+        rts
+
+; RefreshWindowFrame(window a0): redraws the whole frame (borders, title bar, system gadgets), spec intuition-frame §2.
+intuition_RefreshWindowFrame:
+        movem.l d2-d7/a2-a6,-(sp)
+        move.l  a6,a5
+        move.l  a0,a3
+        bsr     wn_border
+        movem.l (sp)+,d2-d7/a2-a6
         rts
 
 ; GetScreenData(buffer a0, size d0, type d1, screen a1) -> d0 = TRUE | FALSE: copies min(size, sizeof Screen)
@@ -955,10 +1144,11 @@ wn_gadborders:
 .gm_ret:
         rts
 
-; wn_gzzlayer(a3 = window whose WD_WLAYER is the whole layer, a5) -> Z = 0 if successful: the whole layer becomes
-; the border layer (WDX_BLAYER, WD_BORDERRPORT) and a layer covering the interior (window minus borders), with the
-; same refresh mode, is created in front: it becomes WD_WLAYER / WD_RPORT (origin in the interior). a6 = SysBase
-; on return. Preserves d2-d7/a2-a5.
+; wn_gzzlayer(a2 = NewWindow, a3 = window whose WD_WLAYER is the whole layer, a5) -> Z = 0 if successful: the whole
+; layer becomes the border layer (WDX_BLAYER, WD_BORDERRPORT) and a layer covering the interior (window minus
+; borders), with the same refresh mode (SUPER_BITMAP: NewWindow.BitMap as SuperBitMap, intuition-gzz-v34), is
+; created in front: it becomes WD_WLAYER / WD_RPORT (origin in the interior). a6 = SysBase on return. Preserves
+; d2-d7/a2-a5.
 wn_gzzlayer:
         movem.l d2-d5/a2,-(sp)
         move.l  WD_WLAYER(a3),a0
@@ -984,11 +1174,17 @@ wn_gzzlayer:
         moveq   #IL_SMART,d4
         moveq   #$C0,d5
         and.b   WD_FLAGS+3(a3),d5
+        move.l  NW_BITMAP(a2),a2
+        cmp.b   #$80,d5              ; SUPER_BITMAP: NewWindow.BitMap is the interior's SuperBitMap
+        bne.s   .gl_nsuper
+        moveq   #IL_SMART|IL_SUPER,d4
+        bra.s   .gl_type
+.gl_nsuper:
+        suba.l  a2,a2
         cmp.b   #$40,d5              ; SIMPLE_REFRESH
         bne.s   .gl_type
         moveq   #IL_SIMPLE,d4
 .gl_type:
-        suba.l  a2,a2
         move.l  WD_WSCREEN(a3),a0
         lea     SC_BITMAP(a0),a1
         lea     SC_LAYERINFO(a0),a0
@@ -1539,12 +1735,18 @@ it_setactive:
         cmp.l   a3,d0
         beq.s   .sa_ret
         move.l  a3,IB_ACTIVEWINDOW(a5)
+        move.l  a3,a0
+        jsr     it_ptrapply          ; the new active window's own pointer, or the default one
         tst.l   d0
         beq.s   .sa_new
         move.l  d0,a3
         and.l   #~WINDOWACTIVE,WD_FLAGS(a3)
         bsr     wn_veil
         move.l  16(sp),a3
+        move.l  a3,d0
+        beq.s   .sa_ret
+        bsr     it_alive             ; closed while the veil waited for a layer lock
+        beq.s   .sa_ret
 .sa_new:
         move.l  a3,d0
         beq.s   .sa_ret
@@ -1589,9 +1791,47 @@ intuition_CloseWindow:
         move.l  a0,a3
         move.l  a0,d0
         beq     .cw_ret
-        bsr     gad_forget           ; a gadget of this window was still pressed
-        jsr     rq_closeall          ; its requesters (and their layers) first
         move.l  WD_WSCREEN(a3),a4    ; a4 = screen
+        ; The input task keeps this window across calls that can block (layer locks): a drag or menus in progress
+        ; finish first, then the window leaves the list and intuition's references in one go. The input task
+        ; checks with it_alive after each blocking call.
+        move.l  ($4).w,a6
+.cw_wait:
+        jsr     LVO_FORBID(a6)
+        cmp.l   IB_DRAGWIN(a5),a3
+        beq.s   .cw_busy
+        cmp.l   IB_MENUWIN(a5),a3
+        bne.s   .cw_detach
+.cw_busy:
+        jsr     LVO_PERMIT(a6)
+        move.l  IB_GFXBASE(a5),a6
+        jsr     LVO_WAITTOF(a6)
+        move.l  ($4).w,a6
+        bra.s   .cw_wait
+.cw_detach:
+        move.l  WD_WLAYER(a3),a0
+        clr.l   IL_WINDOW(a0)
+        move.l  WDX_BLAYER(a3),d0
+        beq.s   .cw_1l
+        move.l  d0,a0
+        clr.l   IL_WINDOW(a0)
+.cw_1l:
+        bsr     it_relist
+        moveq   #0,d7                ; d7 = the window was active
+        cmp.l   IB_ACTIVEWINDOW(a5),a3
+        bne.s   .cw_na
+        clr.l   IB_ACTIVEWINDOW(a5)
+        moveq   #1,d7
+        sub.l   a0,a0
+        jsr     it_ptrapply          ; its pointer data may go with it: default pointer
+.cw_na:
+        move.l  a3,a0
+        exg     a5,a6
+        bsr     gad_forget           ; a gadget of this window was still pressed
+        exg     a5,a6
+        jsr     LVO_PERMIT(a6)
+        move.l  a5,a6
+        jsr     rq_closeall          ; its requesters (and their layers) first
         move.l  IB_LAYERSBASE(a5),a6
         suba.l  a0,a0
         move.l  WD_WLAYER(a3),a1
@@ -1618,9 +1858,8 @@ intuition_CloseWindow:
         move.l  d2,WD_PARENT(a0)
 .cw_nd:
         jsr     LVO_PERMIT(a6)
-        cmp.l   IB_ACTIVEWINDOW(a5),a3
-        bne.s   .cw_act
-        clr.l   IB_ACTIVEWINDOW(a5)  ; was active: its Parent, otherwise the first window of the screen, otherwise none
+        tst.w   d7
+        beq.s   .cw_act              ; was active: its Parent, otherwise the first window of the screen, otherwise none
         tst.l   d2
         bne.s   .cw_new
         move.l  SC_FIRSTWINDOW(a4),d2
@@ -1895,12 +2134,15 @@ wn_refreshmsg:
         moveq   #REFRESHWINDOW,d1
         and.l   WD_IDCMPFLAGS(a3),d1
         beq.s   .rf_ret
+        move.l  a6,-(sp)
+        move.l  ($4).w,a6
+        jsr     LVO_FORBID(a6)       ; tested and claimed in one go (posted from the input task and from applications)
         lea     WDX_IMSG(a3),a1
         cmp.b   #NT_MESSAGE,LN_TYPE(a1)
-        beq.s   .rf_ret              ; the previous one has not been read: it is enough
-        move.l  a6,-(sp)
-        move.l  d0,-(sp)
+        beq.s   .rf_busy             ; the previous one has not been read: it is enough
         move.b  #NT_MESSAGE,LN_TYPE(a1)
+        jsr     LVO_PERMIT(a6)
+        move.l  d0,-(sp)
         clr.l   MN_REPLYPORT(a1)
         move.w  #IM_SIZEOF,MN_LENGTH(a1)
         move.l  #REFRESHWINDOW,IM_CLASS(a1)
@@ -1908,10 +2150,13 @@ wn_refreshmsg:
         move.l  a3,IM_IADDRESS(a1)
         move.l  a3,IM_IDCMPWINDOW(a1)
         move.l  (sp)+,a0
-        move.l  ($4).w,a6
         jsr     LVO_PUTMSG(a6)
         move.l  (sp)+,a6
 .rf_ret:
+        rts
+.rf_busy:
+        jsr     LVO_PERMIT(a6)
+        move.l  (sp)+,a6
         rts
 
 ; intuition_ModifyIDCMP(window a0, classes d0): new IDCMP classes. 0: the UserPort is closed (its pending messages
@@ -2164,8 +2409,13 @@ it_event:
 
 ; it_push(a1 = IntuitionBase, d0.w = code, d1 = x (high word) : y (low word)): slot dropped into the input task's
 ; ring, then signal (ring full: lost). Clobbers d0/d1/a0/a6.
+; Three producers (the feeder task, the DF0: handler, the VBlank interrupt for the mouse): the head is read, the slot
+; written and the head published with interrupts off (bare Disable, as in PutMsg), or two of them fill the same slot.
 it_push:
         move.l  d2,-(sp)
+        move.l  ($4).w,a6
+        addq.b  #1,EB_IDNEST(a6)
+        move.w  #INTF_INTEN,INTENA
         move.w  IB_EVHEAD(a1),d2
         lea     IB_EVRING(a1),a0
         add.w   d2,a0
@@ -2182,10 +2432,18 @@ it_push:
         swap    d1
         move.w  d1,(a0)
         move.w  d2,IB_EVHEAD(a1)     ; published after the data
+        bsr.s   .pu_enable
         move.l  (sp)+,d2
         bra.s   it_signal
 .pu_full:
+        bsr.s   .pu_enable
         move.l  (sp)+,d2
+        rts
+.pu_enable:
+        subq.b  #1,EB_IDNEST(a6)
+        bge.s   .pu_ret
+        move.w  #$C000,INTENA        ; SETCLR + INTEN
+.pu_ret:
         rts
 ; it_signal(a1 = IntuitionBase): wakes up the input task. Clobbers d0/d1/a0/a6.
 it_signal:
@@ -2545,6 +2803,36 @@ it_scrxy:
 .sx_ret:
         rts
 
+; it_alive(a3 = window, a5 = IntuitionBase) -> Z = 1 if the window is no longer in any screen's list (CloseWindow
+; takes it out first). Never reads the window itself, which may already be freed. Preserves everything.
+it_alive:
+        movem.l d0/a0-a1/a6,-(sp)
+        move.l  ($4).w,a6
+        jsr     LVO_FORBID(a6)
+        moveq   #0,d0
+        move.l  IB_FIRSTSCREEN(a5),a0
+.al_scr:
+        cmpa.w  #0,a0
+        beq.s   .al_end
+        move.l  SC_FIRSTWINDOW(a0),a1
+.al_win:
+        cmpa.w  #0,a1
+        beq.s   .al_nscr
+        cmp.l   a3,a1
+        beq.s   .al_found
+        move.l  WD_NEXTWINDOW(a1),a1
+        bra.s   .al_win
+.al_nscr:
+        move.l  SC_NEXTSCREEN(a0),a0
+        bra.s   .al_scr
+.al_found:
+        moveq   #1,d0
+.al_end:
+        jsr     LVO_PERMIT(a6)
+        tst.l   d0
+        movem.l (sp)+,d0/a0-a1/a6
+        rts
+
 ; it_winat(a4 = screen, d4/d5 = position) -> a3 = frontmost window under the point, d2/d3 = relative position;
 ; Z = 1 if none. Clobbers d0.
 it_winat:
@@ -2619,6 +2907,8 @@ it_dobutton:
         bne     .db_mb
         bsr     it_setactive         ; the clicked window becomes active (BACKDROP included: its menus)
         bsr     wn_scrtitle
+        bsr     it_alive             ; both draw and may wait for a lock: the window may have been closed
+        beq     .db_ret
         btst    #3,WD_FLAGS+2(a3)    ; BORDERLESS: no system gadget
         bne     .db_mb
         cmp.b   #WD_TBARH,WD_BORDERTOP(a3)
@@ -3103,6 +3393,8 @@ wn_post:
         and.l   #RAWKEY|MOUSEBUTTONS|MOUSEMOVE|INTUITICKS|MENUPICK,d6
         bne     .sm_ret
 .sm_take:
+        move.l  ($4).w,a6            ; free slot found and claimed in one go: the input task and the application
+        jsr     LVO_FORBID(a6)       ; (SizeWindow, ActivateGadget...) both post to the same pool
         lea     WDX_EMSG(a3),a1
         moveq   #WDX_NEMSG-1,d6
 .sm_find:
@@ -3110,9 +3402,11 @@ wn_post:
         bne.s   .sm_free
         lea     IM_SIZEOF(a1),a1
         dbra    d6,.sm_find
+        jsr     LVO_PERMIT(a6)
         bra.s   .sm_ret
 .sm_free:
         move.b  #NT_MESSAGE,LN_TYPE(a1)
+        jsr     LVO_PERMIT(a6)
         clr.l   MN_REPLYPORT(a1)
         move.w  #IM_SIZEOF,MN_LENGTH(a1)
         move.l  d0,IM_CLASS(a1)
@@ -3121,20 +3415,8 @@ wn_post:
         move.l  a0,IM_IADDRESS(a1)
         move.w  d2,IM_MOUSEX(a1)
         move.w  d3,IM_MOUSEY(a1)
-        move.l  GP_POLLS,d0          ; seconds / microseconds since startup (VBlanks)
-        moveq   #0,d1
-        swap    d0
-        move.w  d0,d1
-        divu    #50,d1               ; long division in two steps (the quotient may exceed 16 bits)
-        move.w  d1,d6
-        swap    d6
-        swap    d0
-        move.w  d0,d1
-        divu    #50,d1
-        move.w  d1,d6                ; d6 = seconds
-        swap    d1
-        mulu    #20000,d1            ; remainder (1/50 s) -> microseconds
-        move.l  d6,IM_SECONDS(a1)
+        bsr     it_now
+        move.l  d0,IM_SECONDS(a1)
         move.l  d1,IM_MICROS(a1)
         move.l  a3,IM_IDCMPWINDOW(a1)
         move.l  WD_USERPORT(a3),a0
@@ -3142,6 +3424,37 @@ wn_post:
         jsr     LVO_PUTMSG(a6)
 .sm_ret:
         addq.l  #2,sp
+        rts
+
+; it_now() -> d0 = seconds, d1 = microseconds since startup (VBlank count GP_POLLS): the clock of the IntuiMessages.
+it_now:
+        move.l  d2,-(sp)
+        move.l  GP_POLLS,d0
+        moveq   #0,d1
+        swap    d0
+        move.w  d0,d1
+        divu    #50,d1               ; long division in two steps (the quotient may exceed 16 bits)
+        move.w  d1,d2
+        swap    d2
+        swap    d0
+        move.w  d0,d1
+        divu    #50,d1
+        move.w  d1,d2                ; d2 = seconds
+        swap    d1
+        mulu    #20000,d1            ; remainder (1/50 s) -> microseconds
+        move.l  d2,d0
+        move.l  (sp)+,d2
+        rts
+
+; CurrentTime(seconds a0, micros a1): the current time on the IntuiMessage clock (spec intuition-misc §5 takes the
+; time stamp of the last input event; ours is the same clock as IntuiMessage Seconds/Micros, so that DoubleClick and
+; time comparisons with messages agree).
+intuition_CurrentTime:
+        movem.l a0-a1,-(sp)
+        bsr.s   it_now
+        movem.l (sp)+,a0-a1
+        move.l  d0,(a0)
+        move.l  d1,(a1)
         rts
 
 ; DoubleClick(seconds d0, micros d1, seconds d2, micros d3) -> d0 = TRUE if the second click follows the first by less
@@ -3169,7 +3482,7 @@ intuition_DoubleClick:
 
 ; Workbench NewScreen
 sc_wbnewscreen:
-        dc.w    0,0,640,256,2        ; LeftEdge, TopEdge, Width, Height, Depth
+        dc.w    0,0,640,-1,2         ; LeftEdge, TopEdge, Width, Height (-1: 256 PAL, 200 NTSC), Depth
         dc.b    2,1                  ; DetailPen (titles and gadgets: black), BlockPen (bars: white)
         dc.w    V_HIRES              ; ViewModes
         dc.w    WBENCHSCREEN         ; Type

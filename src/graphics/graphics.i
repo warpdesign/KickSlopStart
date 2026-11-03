@@ -86,9 +86,12 @@ vp_DWidth    EQU 24
 vp_DHeight   EQU 26
 vp_DyOffset  EQU 30
 vp_Modes     EQU 32
+vp_SpritePri EQU 34           ; SpritePriorities (byte)
 vp_RasInfo   EQU 36
 vp_SIZEOF    EQU 40
 ri_BitMap    EQU 4            ; RasInfo
+ri_RxOffset  EQU 8
+ri_RyOffset  EQU 10
 ri_SIZEOF    EQU 12
 bm_BytesPerRow EQU 0          ; BitMap
 bm_Rows      EQU 2
@@ -172,6 +175,7 @@ LVO_INITRASTPORT EQU -198
 LVO_SETRAST   EQU -234
 LVO_MOVE      EQU -240
 LVO_DRAW      EQU -246
+LVO_WAITTOF   EQU -270
 LVO_RECTFILL  EQU -306
 LVO_SETAPEN   EQU -342
 LVO_SETBPEN   EQU -348
@@ -191,6 +195,7 @@ LVO_BLTBITMAPRASTPORT EQU -606
 LVO_CHANGESPRITE EQU -420
 LVO_MOVESPRITE EQU -426
 V_HIRES       EQU $8000        ; vp_Modes: high resolution (640 px)
+VP_HIDE       EQU $2000        ; vp_Modes: ViewPort hidden behind another screen
 
 ; --- GfxBase: public V34 layout (graphics/gfxbase.i) then private fields beyond ---
 gb_ActiView  EQU 34           ; APTR: active View (set by LoadView)
@@ -212,6 +217,7 @@ gb_NormalDisplayColumns EQU 218
 gb_NormalDPMX EQU 220
 gb_NormalDPMY EQU 222
 gb_MicrosPerLine EQU 232      ; UWORD: 256 × duration of one line in µs
+gb_MinDisplayColumn EQU 234
 GB_PUBLIC    EQU 242          ; end of the V34 public part (including reserved[2])
 ; private fields: hardware sprites
 gb_SprNull   EQU GB_PUBLIC    ; APTR: empty sprite (chip, POS/CTL = 0) for channels without an image
@@ -221,6 +227,7 @@ gb_SprUsed   EQU GB_PUBLIC+40 ; WORD: channels reserved by GetSprite (bit n = ch
 gb_BlitSem   EQU GB_PUBLIC+42 ; SignalSemaphore (46 bytes): blitter ownership (OwnBlitter / DisownBlitter)
 GB_SS_OWNER  EQU 40           ; struct SignalSemaphore : ss_Owner
 GFXBASE_SIZE EQU GB_PUBLIC+42+46
+DISPF_NTSC   EQU 1
 DISPF_PAL    EQU 4
 
 ; --- struct SimpleSprite (graphics/sprite.h) and sprite registers ---

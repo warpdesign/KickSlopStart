@@ -26,7 +26,7 @@ CIAA_PRA  EQU $BFE001
 CIAA_DDRA EQU $BFE201
 
 ; --- A500 512K target memory map ---
-MAXCHIP      EQU $00080000
+MAXCHIP      EQU $00080000     ; chip assumed at reset; init_memory sizes the rest (up to 2 MB)
 MH_CHIP      EQU $00000400     ; chip MemHeader
 LOWVARS_LO   EQU $00000500     ; global variables in low RAM [LOWVARS_LO, LOWVARS_HI), zeroed at coldstart
 LOWVARS_HI   EQU $00000800
@@ -36,16 +36,17 @@ TST_N2       EQU $00000460
 ; System area in LOW CHIP, just above the low-RAM variables: the top of chip stays free up to
 ; $80000 as on the real 1.3, because programs write there at absolute addresses (intros: stack at $7FFFE, routines
 ; at $7F000, planes at $70000+). ExecBase must not be located there.
-EXEC_BLOCK   EQU $00001000     ; bottom of exec's jump table
+; With slow RAM, the jump table and ExecBase go to the bottom of it instead (after the soft-kick image), as on 1.3
+; (coldstart-hardware-v34 §4.1): games load over low chip and still read ExecBase (Zool reads MaxExtMem there).
+EXEC_BLOCK   EQU $00001000     ; bottom of exec's jump table without slow RAM
 EXEC_NEGSIZE EQU $276          ; 105 V34 vectors (cf docs/exec-lvo-table.md)
-EXECBASE     EQU EXEC_BLOCK+EXEC_NEGSIZE ; SysBase (complete V34 table below)
-EXEC_POSSIZE EQU $230
+EXECBASE     EQU EXEC_BLOCK+EXEC_NEGSIZE ; SysBase without slow RAM (complete V34 table below)
+EXEC_POSSIZE EQU $234          ; V34 fields end at KickCheckSum ($22E); +$230 = our EB_INTSVL
 FTEST_LO     EQU $00001500     ; region DISJOINT from the heap for the multi-header test (M2.4a selftest); then free,
 FTEST_HI     EQU $00002500     ; it serves as a margin below the supervisor stack (an overflow does not reach ExecBase)
 SSP_LOWER    EQU $00002500     ; shared supervisor stack [SSP_LOWER, STACKTOP)
 STACKTOP     EQU $00003500
 HEAP_LOWER   EQU $00003500     ; managed heap (chip)
-HEAP_UPPER   EQU MAXCHIP
 
 ; --- Phases (12-bit RGB) ---
 C_RED    EQU $0F00
@@ -54,8 +55,22 @@ C_CYAN   EQU $00FF
 C_WHITE  EQU $0FFF
 C_FAIL   EQU $0F0F
 
-SERPER_9600_PAL EQU 368
+SERPER_RAW      EQU 372          ; RawIOInit value (custom-chips-v34 §4.3): 9509 Bd PAL, 9597 Bd NTSC, 8 bits
+; RAMKICK=1 (make kick-ram): image linked at $C00000, loaded into slow RAM by the soft-kick disk (src/softkick/).
+; The first SLOW_RSV bytes of slow RAM hold the image and stay out of the free memory. Default 0 = ROM image.
+        ifnd    RAMKICK
+RAMKICK  EQU 0
+        endif
+        if      RAMKICK
+ROMBASE  EQU $C00000
+SLOW_RSV EQU $40000
+        else
 ROMBASE  EQU $FC0000
+SLOW_RSV EQU 0
+        endif
+SLOW_BASE   EQU $00C00000      ; A500 "slow" RAM (trapdoor)
+SLOW_STEP   EQU $00080000      ; 512 KB granularity
+SLOW_MAXBLK EQU 3              ; up to 1.5 MB ($C00000-$D7FFFF)
 
 ; --- Interrupts (hardware/intbits.i + 68000 autovectors) ---
 INTF_SETCLR  EQU $8000        ; INTENA/INTREQ: 1 = sets the bits, 0 = clears them
@@ -75,7 +90,7 @@ INTM_L5      EQU $1800        ; level 5 sources
 AUTOVEC_L2   EQU $68          ; 68000 level 2 autovector (INT2 / CIA-A / PORTS)
 AUTOVEC_L3   EQU $6C          ; 68000 exception vector, level 3 interrupt
 AUTOVEC_L6   EQU $78          ; 68000 level 6 autovector (INT6 / CIA-B / EXTER)
-ROM_BASE     EQU $00FC0000     ; start of the ROM (256 KB)
+ROM_BASE     EQU ROMBASE       ; start of the ROM image (256 KB)
 PRIV_VEC     EQU $20          ; privilege violation: exec entry into supervisor (EXEC_SVC)
 SVC_MAGIC    EQU $4AFC        ; word following the "ori.w #0,sr" of an EXEC_SVC site (ILLEGAL, never executed)
 
@@ -99,10 +114,17 @@ EXEC_SVC     macro
 .svr\@:
              endm
 LVO_SUPERVISOR EQU -30        ; exec Supervisor(): calls a routine (a5) in supervisor mode (required by flt-intro)
-; M7c — context frame (mirror of movem d0-d7/a0-a6 + CPU {SR,PC}), placed on the task's stack.
-; 15 GPR longs (60 bytes) + SR (word, offset 60) + PC (long, offset 62) = 66 bytes (even -> word-by-word copy).
-FRAME_SR     EQU 60           ; offset of the saved SR in the frame (S bit test = user boundary)
-FRAME_SIZE   EQU 66           ; total size of the relocated frame (GPR+SR+PC)
+LVO_EXITINTR   EQU -36        ; private scheduling entries (exec_lib.fd V34: ExitIntr..Exception)
+LVO_SCHEDULE   EQU -42
+LVO_RESCHEDULE EQU -48
+LVO_SWITCH     EQU -54
+LVO_DISPATCH   EQU -60
+LVO_EXCEPTION  EQU -66
+; Supervisor-stack frame of an interrupted/switching task: movem d0-d7/a0-a6 (60 bytes) above the CPU {SR, PC}.
+; The context saved on the task's USER stack (tc_SPReg) has the same size but the V34 layout of
+; exec-scheduling-v34 §4.1: PC (long, +0), SR (word, +4), D0-D7 (+6), A0-A6 (+$26); USP = tc_SPReg + 66.
+FRAME_SR     EQU 60           ; offset of the saved SR in the supervisor-stack frame (S bit test = user boundary)
+FRAME_SIZE   EQU 66           ; size of either form (15 registers + SR + PC)
 INTB_PORTS   EQU 3            ; Paula PORTS interrupt number (INT2) — cf. hardware/intbits.i
 INTB_COPER   EQU 4            ; M7g: COPER number (INT3) — INTF_COPER=$0010=bit4
 INTB_VERTB   EQU 5            ; M7f: VERTB number (INT3) — INTF_VERTB=$0020=bit5
@@ -327,8 +349,7 @@ M7L_STAT       EQU $000005F0  ; UBYTE: b0 = "M7L MICROHZ CALIB OK" marker alread
 GFX_COPLIST_PTR EQU $000005F4 ; M4a: long — chip address of the copper list (published by gfx_display_init)
 DOS_HANDLERPORT EQU $000005F8 ; D3a: long — APTR of the pr_MsgPort of the echo handler process (published by the setup)
 DOS_FSPORT      EQU $000005FC ; D3b: long — APTR of the pr_MsgPort of the DF0: (OFS) file-handler process
-TD_CURCYL       EQU $00000600 ; trackdisk: word — current cylinder of the head (valid iff TD_CYLVALID != 0)
-TD_CYLVALID     EQU $00000602 ; trackdisk: byte — 0 = unknown position (recalibrate); !=0 = TD_CURCYL reliable
+TD_CUNIT        EQU $00000600 ; trackdisk: long — state of the unit being accessed (in the device base)
 DOS_CONPORT     EQU $00000604 ; E1: long — APTR of the serial console handler process's pr_MsgPort (published by setup)
 CON_STATE       EQU $00000608 ; E1: long — APTR of the console handler state block (timer.device + reply port + request)
 ; F2b: SPSC keyboard ring (producer = kbd_interrupt/INT2; consumer = con_handler READ). Lock-free:
@@ -358,6 +379,7 @@ IECLASS_DISKINSERTED EQU 16      ; ie_Class: floppy inserted and mounted
 IEQUALIFIER_REPEAT EQU $0200     ; ie_Qualifier: automatic key repeat event
 IECODE_LBUTTON  EQU $68          ; ie_Code: left button (down; up = | $80)
 IECODE_RBUTTON  EQU $69          ; ie_Code: right button (down; up = | $80)
+IECODE_MBUTTON  EQU $6A          ; ie_Code: middle button (down; up = | $80)
 IECODE_NOBUTTON EQU $FF          ; ie_Code: pure movement event (no button)
 IECODE_UP_PREFIX EQU $80         ; ie_Code: release (button code | $80)
 IE_NEXTEVENT    EQU 0            ; struct InputEvent: APTR next event
@@ -403,21 +425,19 @@ REQ_HIT      EQU $00000682 ; word: requester — gadget hit by a click (set by r
 ; pointer_input_handler (intuition, pri 50) accumulates these RELATIVE deltas into an ABSOLUTE position clamped to
 ; the screen and rewrites ie_X/ie_Y -> the existing req_input_handler (pri 0) hit-tests in absolute, unchanged = the
 ; live wiring.
-PTR_XMAX     EQU 320            ; screen bounds for the pointer clamp (320x256: console/bootscreen)
-PTR_YMAX     EQU 256
+PTR_XMAX     EQU 320            ; pointer X bound (lores pixels)
+PTR_YLIM     EQU $0000069E ; word: pointer Y bound = GfxBase NormalDisplayRows (256 PAL, 200 NTSC), set by graphics init
 GP_POLLS_THRESH EQU 25          ; VBlank polls (~0.5 s) before "GP VBLANK LIVE OK" (server lives in the system)
 PTR_X        EQU $00000684 ; word: absolute pointer X (accumulated by pointer_input_handler, clamped)
 PTR_Y        EQU $00000686 ; word: absolute pointer Y
 INT_IBASE    EQU $00000740 ; long: IntuitionBase (set at its init) — the pointer handler moves the sprite with it
 KBD_DEVBASE  EQU $00000744 ; long: keyboard.device base (set at its init) — kbd_interrupt hands each keycode to it
 TD_CDIRTY    EQU $00000748 ; trackdisk: TD_NCACHE bytes — slot modified by CMD_WRITE, not yet written to disk
-TD_CHGCNT    EQU $00000750 ; trackdisk: long — disk change counter (TD_CHANGENUM)
-DOS_OWCTX    EQU $00000754 ; dos: long — OFS write context (ofswrite.s), allocated on first need
+TD_BASEP     EQU $00000750 ; trackdisk: long — device base (semaphore and units for td_disk_present / slot flushes)
 EXEC_SOFTLIST EQU $00000758 ; exec: struct List (14 bytes) of the pending software interrupts (Cause)
 EXEC_ALERTSTUB EQU $00000766 ; exec: 6 bytes — JMP exec_Alert in RAM: Alert vector points here (not ROM, cf. setpatch-138.md)
 DOS_HSEM     EQU $0000076C ; dos: SignalSemaphore (46 bytes, up to $799) — only one handler start at a time
-HND_CTX      EQU $000007C0 ; dos: long — context of the DF0: file-handler (disk change, handler.s)
-HND_REFVOL   EQU $000007C4 ; dos: long — BPTR of the absent volume of the DF0: handler's last 218 refusal ("replace")
+HND_REFVOL   EQU $000007C4 ; dos: long — BPTR of the absent volume of the last 218 refusal of a floppy handler ("replace")
 MT_TABLE     EQU $0000079C ; long: allocation tracer table (diagnostic ROM -DMEMTRACK=1 only)
 INT2_BUSY    EQU $000007A0 ; byte: int2_dispatch serves the PORTS chain (read by timer.device VBLANK server recovery)
 TD_DMATASK   EQU $000007A2 ; trackdisk: long — task waiting for the end of a disk DMA (SIGF_SINGLE), 0: none
@@ -433,7 +453,8 @@ GP_CAP_N     EQU $00000694 ; word: RAWMOUSE events seen by the capture handler (
 GP_CAP_CODE  EQU $00000696 ; word: last captured ie_Code
 GP_CAP_DX    EQU $00000698 ; word: last captured ie_X (delta)
 GP_CAP_DY    EQU $0000069A ; word: last captured ie_Y (delta)
-GP_LIVE_STAT EQU $0000069C ; byte: b0 = "GP VBLANK LIVE OK" already emitted +pad $69D
+GP_LIVE_STAT EQU $0000069C ; byte: b0 = "GP VBLANK LIVE OK" already emitted
+GP_PREV_MBTN EQU $0000069D ; byte: previous middle button (edge-detect, like GP_PREV_RBTN)
 GP_VBL_INT   EQU $000006A0 ; struct Interrupt (IS_SIZE=22) of the gameport VBlank server -> $6A0..$6B5
 ; CONSUMER handlers of the requester, registered PERSISTENTLY on input.device in the M6R insert-disk branch
 ; (no teardown) -> the gameport->input.device->pointer->requester chain is LIVE in the running system
@@ -445,9 +466,7 @@ FB_TASK      EQU $000006E6 ; long: TCB of task_fb (so that task_fa signals it)
 SH_STK       EQU 8192       ; stack of the initial CLI (shell.s): the commands it launches run on it
 TD_CACHEBUF  EQU $000006EA ; trackdisk: long — cache of decoded tracks (TD_CNSLOTS x 5632 bytes; 0 = not yet allocated)
 TD_CNSLOTS   EQU $000006EE ; trackdisk: word — number of cache slots (TD_NCACHE, or 1 if memory is tight)
-TD_MOTORON   EQU $00000700 ; trackdisk: byte — DF0 motor on (latched): no spin-up at the next read
 TD_BUSY      EQU $00000701 ; trackdisk: byte — drive access in progress (the VBlank server does not turn the motor off)
-TD_MOTORCNT  EQU $00000702 ; trackdisk: word — VBlank ticks before turning off the idle motor
 TD_VBLINT    EQU $00000704 ; trackdisk: struct Interrupt (22 bytes) of the motor turn-off VBlank server
 TD_MOTORIDLE EQU 100       ; 2 s of inactivity (50 Hz) before turn-off, like the delay of the original trackdisk
 TD_CTICK     EQU $0000071A ; trackdisk: word — LRU clock of the track cache
@@ -461,7 +480,7 @@ DOS_DOSBASE  EQU $000006F0 ; long: DosBase (set by dos initFunc) — the BCPL ru
 GP_NO_WRAP   EQU 0
 
 ; SCHED_NO_FORBID_GATE=1 (RED Forbid atomicity): removes the EB_TDNEST/EB_IDNEST guard of intr_isr_defer -> a
-; deferred dispatch (AttnResched) happens EVEN under Forbid -> a task printing under Forbid is preempted in
+; deferred dispatch (SAR) happens EVEN under Forbid -> a task printing under Forbid is preempted in
 ; the middle of ser_puts -> "FORBID ATOMIC OK" absent (task_fb preempts task_fa during its Forbid and sets the flag).
 ; M3F LIVE stays present (task_l's Forbid window is short + its yield-on-Permit wants task_h precisely).
 ; Isolates the Forbid guard at the preemption consumption point. Default 0.
@@ -528,6 +547,7 @@ LN_TYPE      EQU 8
 LN_PRI       EQU 9           ; priority (signed BYTE) — Enqueue sorting
 LN_NAME      EQU 10
 LH_TAIL      EQU 4
+LH_TAILPRED  EQU 8
 NT_LIBRARY   EQU 9
 LIB_NEGSIZE  EQU $10
 LIB_POSSIZE  EQU $12
@@ -550,16 +570,28 @@ TIMER_UVBL   EQU LIB_SIZE+44   ; long: VBL_COUNT of the last time read
 TD_SIZE      EQU LIB_SIZE+48   ; size of the timer.device base (Library + 2 unit lists + system time + arming)
 UNIT_MICROHZ EQU 0             ; unit selector in IO_UNIT (= real timer.device numbering)
 UNIT_VBLANK  EQU 1             ; (OpenDevice would set a struct Unit*; our minimal impl = the index)
+EB_SOFTVER    EQU $22
 EB_CHKBASE    EQU $26
+EB_COLDCAPTURE EQU $2A
+EB_CHKSUM     EQU $52         ; complement of the word sum of +$22..+$4E (checked over +$22..+$52 = $FFFF)
 EB_MAXLOCMEM  EQU $3E
+EB_MAXEXTMEM  EQU $4E         ; end of the slow RAM, 0 without
+EB_DEBUGENTRY EQU $42          ; APTR: entry of the debugger (Debug)
 EB_THISTASK   EQU $114         ; current task (struct Task *)
+EB_IDLECOUNT  EQU $118         ; ULONG: idle wake-ups of the dispatcher
+EB_DISPCOUNT  EQU $11C         ; ULONG: dispatches
+EB_QUANTUM    EQU $120
+EB_ELAPSED    EQU $122
+EB_SYSFLAGS   EQU $124         ; UWORD; as a byte: bit 7 SAR (reschedule pending), bit 6 TQE (quantum elapsed)
+SFB_SAR       EQU 7            ; bit numbers inside the BYTE at EB_SYSFLAGS
+SFB_TQE       EQU 6
 EB_IDNEST     EQU $126
 EB_TDNEST     EQU $127
 EB_ATTNFLAGS  EQU $128
-EB_ATTNRESCHED EQU $12A         ; UWORD: pending reschedule (set by Signal, consumed
-                                ; by Permit/Enable when the nesting unlocks = yield)
 EB_RESMODULES EQU $12C          ; APTR: NUL-terminated array of struct Resident* (pri-sorted)
 EB_TASKTRAPCODE EQU $130        ; APTR: default trap handler of the tasks
+EB_TASKEXCEPTCODE EQU $134      ; APTR: default exception handler of the tasks
+EB_TASKEXITCODE EQU $138        ; APTR: final PC of a task added with finalPC 0
 EB_MEMLIST      EQU $142
 EB_RESOURCELIST EQU $150
 EB_DEVICELIST   EQU $15E
@@ -573,8 +605,11 @@ EB_VBLANKFREQ   EQU $212
 EB_POWERFREQ    EQU $213
 EB_SEMLIST      EQU $214
 EB_INTVECTS     EQU $54         ; IntVects[16] (struct IntVector, 12 bytes): public, up to ThisTask ($114)
-EB_INTSVL       EQU $222        ; M7b: APTR -> block of the 16 server lists (AddIntServer), AllocMem'd
-                                ; at init_ints. Fits in the positive area ($222+4 <= EXEC_POSSIZE $230).
+EB_KICKMEMPTR   EQU $222        ; reset survival: MemList chain
+EB_KICKTAGPTR   EQU $226        ; reset survival: ROMTag pointer table
+EB_KICKCHECKSUM EQU $22A        ; SumKickData() of the two above
+EB_INTSVL       EQU $230        ; M7b: APTR -> block of the 16 server lists (AddIntServer), AllocMem'd at init_ints.
+                                ; Private, after the V34 fields: KickMemPtr ($222) must stay 0 (virus checkers).
 
 ; struct MemHeader / MemChunk + memory attributes (exec/memory.i, V34)
 NT_MEMORY     EQU 10
@@ -599,8 +634,11 @@ NT_INTERRUPT  EQU 2
 TS_RUN        EQU 2           ; task running
 TS_READY      EQU 3
 TS_WAIT       EQU 4           ; task blocked (Wait/WaitPort) -> TaskWait list
-TS_REMOVED    EQU 5           ; M7j: task being removed (RemTask)
+TS_REMOVED    EQU 6           ; task removed (RemTask)
 TC_FLAGS      EQU 14
+TB_EXCEPT     EQU 5           ; tc_Flags bits: exception pending, tc_Switch / tc_Launch hooks enabled
+TB_SWITCH     EQU 6
+TB_LAUNCH     EQU 7
 TC_STATE      EQU 15
 TC_IDNESTCNT  EQU 16
 TC_TDNESTCNT  EQU 17
@@ -610,12 +648,17 @@ TC_SIGRECVD   EQU 26
 TC_SIGEXCEPT  EQU 30
 TC_TRAPALLOC  EQU 34          ; UWORD: traps 0-15 allocated (AllocTrap)
 TC_TRAPABLE   EQU 36
+TC_EXCEPTDATA EQU 38          ; APTR: passed in A1 to tc_ExceptCode
+TC_EXCEPTCODE EQU 42          ; APTR: task exception handler
 TC_TRAPDATA   EQU 46          ; APTR: free data of the task's trap handler
 TC_TRAPCODE   EQU 50          ; APTR: handler of the task's CPU exceptions (0 -> TaskTrapCode)
 TC_SPREG      EQU 54
 TC_SPLOWER    EQU 58
 TC_SPUPPER    EQU 62
+TC_SWITCH     EQU 66          ; APTR: called when the task loses the CPU (TB_SWITCH)
+TC_LAUNCH     EQU 70          ; APTR: called when the task is dispatched (TB_LAUNCH)
 TC_MEMENTRY   EQU 74          ; struct List: MemLists freed by RemTask (FreeEntry)
+TC_USERDATA   EQU 88          ; APTR free for the owner of the task (file-handlers: their context, ofs.i)
 TC_SIZE       EQU 92
 ML_NUMENTRIES EQU 14          ; exec/memory.i: struct MemList (Node, NumEntries, MemEntry[])
 ML_ME         EQU 16
@@ -773,9 +816,12 @@ CIA_REMICRVECTOR EQU -12
 CIA_ABLEICR      EQU -18
 CIA_SETICR       EQU -24
 CIAR_HWBASE      EQU LIB_SIZE        ; APTR CIA hardware base (after the Library node)
-CIAR_ICRMASK     EQU LIB_SIZE+4      ; UBYTE shadow of the enabled ICR mask (+pad)
-CIAR_VECTORS     EQU LIB_SIZE+6      ; 5 APTR: struct Interrupt* slots (timerA/B/TOD/ser/flag)
-CIAR_SIZE        EQU LIB_SIZE+6+20
+CIAR_INTBIT      EQU LIB_SIZE+4      ; UWORD INTENA/INTREQ bit of the CIA's level (PORTS / EXTER)
+CIAR_ICRMASK     EQU LIB_SIZE+6      ; UBYTE software copy of the enabled ICR mask
+CIAR_PENDING     EQU LIB_SIZE+7      ; UBYTE ICR flags read but not dispatched yet
+CIAR_SERVER      EQU LIB_SIZE+8      ; struct Interrupt slot of the 1.3 layout (our servers are registered by boot.s)
+CIAR_VECTORS     EQU LIB_SIZE+30     ; 5 struct IntVector (data, code, node), ICR bits 0-4
+CIAR_SIZE        EQU LIB_SIZE+30+5*IV_SIZE
 CIAA_HW          EQU $BFE001         ; CIA-A base
 CIAB_HW          EQU $BFD000         ; CIA-B base
 CIA_ICR_OFF      EQU $D00            ; offset of the ICR register (register $D) from the CIA base

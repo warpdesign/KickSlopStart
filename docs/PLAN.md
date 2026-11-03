@@ -450,7 +450,7 @@ bytes: **ROM-ID word (`0x1111`) + `4EF9` (JMP) + coldstart address** (our dump: 
       RED `D3A_NO_REPLY` (handler does not `ReplyMsg` → driver blocked) → D3A absent. GREEN-BOOT (D3A + non-reg
       D1/D2/M3F/M7A/M7C/M7D, 0 FAILED) + RED + COOP (D3A exercised COOPERATIVELY, SCHED_ON=0) + CTRL-NODISK (D3A
       present, disk-independent; D1/D2 absent). GREEN checksum `0x47B39093`. NEXT: D3b (OFS handler).
-    - **D3b — DF0: file-handler process + dos_sendpkt (DONE).** `src/dos/handler.s` (`dos_handler_df0`): a real
+    - **D3b — DF0: file-handler process + dos_sendpkt (DONE).** `src/dos/handler.s` (`dos_handler_df0`, `dos_handler` since DF1): a real
       process that loops `WaitPort`/`GetMsg` and serves `ACTION_FINDINPUT`/`READ`/`END` via `ofs_read_file` (D1).
       `FINDINPUT` (ARG1=BPTR FileHandle, ARG3=BSTR name) reads the WHOLE file into a handler buffer (deliberate
       simplification: incremental OFS reads deferred), sets `fh_Arg1`=state{buffer,size,pos}; `READ`(key,buf,len)
@@ -895,6 +895,30 @@ bytes: **ROM-ID word (`0x1111`) + `4EF9` (JMP) + coldstart address** (our dump: 
     and publish it with its SHA-256.
     Real keymaps (struct KeyMap, keymap.resource V34 layout, console CD_* commands, dead keys) and SetMap support: the
     German Workbench 1.3.3 disk boots with its keyboard (GitHub user report). Remaining: Latin-1 glyphs in the font.
+    Memory audit against 1.3 (docs/MEMORY-USAGE.md, MEMTRACK now records the caller): the 45 KB track cache and
+    the 4 KB intuition input task are kept on purpose; the 10 KB chip bitmap left by the console boot self-test is
+    now freed. Race audit: Flood holds the layer lock, and a CON handler EOF READ no longer falls into
+    DISK_INFO. Also fixed: trackdisk serialized by a semaphore; input and gameport reply to non-QUICK requests;
+    the intuition event ring, the IntuiMessage pool and the console keymap are made atomic; the DosList is walked
+    under Forbid; CloseWindow no longer races the input task (clicks, drags, menus). Remaining suspects: lock
+    order in ClipBlit/ScrollRaster, sendpkt reply matching, the boot CLI console handler blocking on READ.
+    Ed 1.14 works (issue #6): console window bounds report, CSI @/P line shifts, BCPL output through an
+    overridden wrch, and the feeder self-test that stole a key is removed from the production ROM.
+    ScrollRaster scrolls horizontally too, ACTION_WAIT_CHAR waits up to its delay, and the last race suspects are
+    fixed: ClipBlit lock order, ScrollRaster without waiting for a busy blitter, sendpkt reply matching
+    (dos_waitreply), boot CLI console serving WRITEs while a READ waits.
+    Workbench icons selected with their alternate image when the icon asks for it (GADGHIMAGE, issue #7).
+    Window resizing (issue #10): simple layers come out blank and fully damaged after Move/SizeLayer, real
+    SuperBitMap layers (SuperClipRects, ScrollLayer, Sync/CopySBitMap, GZZ interior), RectFill pattern regression
+    fixed. Workbench 1.2 boots to its desktop: rdargs("") = one key, startup-sequence run as cli_CurrentInput,
+    commands looked up in the CLI path. Next: NEWSIZE only for the size gadget.
+    Default pointer filled in dark purple (deliberate difference; a different arrow from the original, measured).
+    Soft-kick disk (`make adf`, published with each release and on the `rom` branch): loads an image linked at
+    $C00000 into slow RAM from a real Kickstart 1.3; coldstart honours ColdCapture and exec computes ChkSum, so a
+    reset comes back to the image.
+    Chip RAM sized up to 2 MB as on 1.3 (was a fixed 512 KB): Caesar loads with 2 MB chip and no fast RAM.
+    SCREENBEHIND honoured by OpenScreen: SimCity's title screen stays hidden while it is drawn.
+    gameport.device units 0/1 with every GPD_* command (joysticks on port 2); exec raw serial as in 1.3.
     trackdisk robust to long tracks (ESP32 emulator amiga500-esp32, error 121): decoder up to the very end of the
     buffer, mask of distinct sectors, re-read of an incomplete track (4 times), error rather than stale
     contents; unicorn test tests/td_decode_test.py (99/99, the old code 30 failures out of 33 with an 830-byte gap).
@@ -908,6 +932,12 @@ bytes: **ROM-ID word (`0x1111`) + `4EF9` (JMP) + coldstart address** (our dump: 
     BltClear, PolyDraw, VBeamPos, FreeSprite, GetRGB4; intuition: ShowTitle, ViewPortAddress. Proven under FS-UAE
     (tests/dskchg_run.sh): welcome screen, editor, FILES (disk list), PLAY, PLAY SONG (playback, TIMER),
     STOP, keyboard arrows; harness: serial capture (DSKCHG_SERIAL), key command, keyboard joystick turned off.
+    DF1: external drive (2026-10-30, user request: Extras 1.3 icon with the Extras disk in DF1): trackdisk units
+    1-3 made real (per-unit select line, motor, head position, change counter; device semaphore; shared cache keyed
+    by unit), one file-handler process per drive (context in tc_UserData, unit from the FileSysStartupMsg), "DF1"
+    DeviceNode mounted when disk.resource identifies a 3.5" drive. Proven under Copperline (Extras 1.3 icon, 1-drive
+    boot unchanged, DF1 insertion after boot). Remaining: DF2/DF3 mounting, writes to DF1 not exercised on a
+    writable disk yet.
     **Interleaved — SetPatch / SysInfo (user request 2026-10-21, before resuming the Workbench)**: complete V34
     exec (real SetFunction & 33 other LVOs), shell that honours `cli_Module`, Alert relay, DeleteLayer in three
     steps, public V34 GfxBase, CIA TODs started, DF0 FileSysStartupMsg; SysInfo displays its whole page
@@ -917,6 +947,61 @@ bytes: **ROM-ID word (`0x1111`) + `4EF9` (JMP) + coldstart address** (our dump: 
     **Next**: `SetFunction`, NIL:/redirections, LoadWB (workbench, icon.library, layers).
 - **M7+ — long tail**: layers, console, input, audio, gameport, mathffp, workbench.task, parity;
   then **real A500 EPROM** (256K ROM, wiring/adapter).
+  **Custom-chip parity (2026-11-02)**: `docs/analysis/custom-chips-v34.md` maps every Agnus/Denise/Paula access of
+  the official ROM to its module and LVO; its §7 lists our gaps by impact. Done the same day: AddIntServer /
+  RemIntServer drive INTENA, LoadView(NULL) keeps the DMA on (empty list + CPU display reset), DSKEN enabled once
+  by disk.resource, PAL/NTSC detected from the beam. Then: POTGO rewritten every frame by the gameport server,
+  middle button events, Workbench and default-height screens 200 lines on NTSC (pointer bounded likewise). Open:
+  autovector order and acknowledge timing, raw serial, the 272-line boot picture on NTSC.
+  **Already-specified LVOs (lot 1, 2026-11-02)**: done — graphics InitView/InitVPort/Get-FreeColorMap/FreeCprList/
+  FreeCopList/WaitBOVP/BltPattern/ScrollVPort (+ RasInfo offsets in MakeVPort), intuition SetPointer/ClearPointer/
+  Lock-UnlockIBase/CurrentTime/Intuition()/AlohaWorkbench/CloseWorkBench/WBenchToFront-Back/MoveScreen/MakeScreen/
+  ActivateWindow/RefreshWindowFrame, layers Fatten/ThinLayerInfo, console CDInputHandler, dos WaitForChar.
+  **Lot 2 specs (2026-11-02)**: done — gameport GPD_* (f1f5e23), keyboard/input generic commands and
+  IND_SETMPORT/MTYPE/MTRIG, trackdisk RAWREAD/RAWWRITE/GETDRIVETYPE/CHANGEINT/SEEK/REMOVE, cia SetICR and the
+  resource layouts, exec Schedule/Reschedule/Switch/Dispatch/ExitIntr/Exception/Debug/Procure/Vacate/SumKickData,
+  dos Exit (GetPacket/QueuePacket left null on purpose). Binary and AROS similarity audits at the base level.
+  Open: trackdisk unit task (autonomous change polling), input.device task, joystick types through SETMTYPE,
+  INDEXSYNC now that SetICR exists, the Workbench menu items (Open, Info, Discard...) stay enabled while no
+  icon is selected (our workbench task; 1.3 behaviour to probe), trackdisk allocates its 12.8 KB chip DMA buffer
+  at each read (1.3 shows no such per-read allocation: a chip-full game could lose its disk reads), Bubble Bobble
+  makes two allocations on 1.3 (9,876 and 177,152 bytes) that it does not make on ours (other code path, cause
+  unknown), screens below the front one are not displayed (MoveScreen only updates the
+  fields). (The "Empty"/"Diverse" overlap in the Workbench 1.3.3 [m2] disk window is in the disk's data: the
+  "Diverse.info" added in 1997 is positioned at 329,15, over "Empty" at 299,0.)
+  **Blitter masks, issue #15 (2026-11-02)**: BLTAFWM/BLTALWM = $FFFF at graphics init; the Kefrens Desert Dream
+  spaceship is drawn again. Other blitter registers 1.3 leaves behind are not known (oracle probe if a program needs
+  one).
+  **Workbench Shells, issue #13 (2026-11-02)**: EndCLI closes the window, the first Shell is number 1, a second
+  Shell after an EndCLI no longer crashes (stale console read, CreateProc block freed twice), 48 bytes per Shell
+  cycle (1.3: 56). Open: per-Shell cost ~52 KB vs 33-40 KB on 1.3 (CP_STKEXTRA 4 KB per BCPL stack; 1.3 refresh
+  type of the Workbench backdrop and drawers to probe), idle desktop ~22 KB below 1.3 (docs/MEMORY-USAGE.md).
+  **ROM ID block (2026-11-03, vAmigaWeb request)**: `KSS!` at `$18` + version string at `$1C`, so emulators label
+  any KickSlopStart image without a hash database; documented as a stable format in the README.
+  **WinUAE suite, 2026-11-03**: Shanghai (hunk count bound, doubled HUNK_END, LED bit of CIA-A PRA) and the
+  Lemmings demo (boot assigns with lock 0 for missing directories, TAB in command lines) start as on 1.3.
+  Not checked on 1.3: whether S and SYS also get a lock-0 assign when missing (we create S).
+  **pr_StackSize, issue #16 (2026-11-03)**: set at process creation (dos-v34-spec §4a, measured on 1.3); Directory
+  Opus 4.12 starts from its boot disk (it stopped on "Stack must be at least 16384 bytes!"). Differences left: our
+  Initial CLI reports 8192 (1.3: 1600, its commands run on a separate stack in both), and the stack block is a
+  separate allocation instead of following the Process.
+  **Custom bootblocks (2026-11-02)**: the strap jumps to the entry the bootblock returns in A0 and runs the
+  boot code with the interrupts enabled. Tintin on the Moon reaches its game (it started AmigaDOS), Spaceballs
+  "State of the Art" starts (white screen before); Zool, Kefrens Desert Dream, Workbench 1.3.3 and Lemmings
+  unchanged. `assets/boot_c.adf` must be regenerated with `tests/mk_boot_adf.sh` (its bootblock now returns the
+  dos init).
+  **Zool (2026-11-02)**: stuck on "PLEASE PRESS FIRE TO START" (issue seen on a real A500, reproduced under
+  Amiberry); the game had crashed after copying its code to the wrong place, because ExecBase (in low chip) was
+  overwritten by its load and MaxExtMem was never set. Fixed: ExecBase at the bottom of the slow RAM as on 1.3,
+  MaxExtMem set. Zool reaches its front-end and hiscores with port-2 fire, on the ROM and through the soft-kick
+  disk; on 1.3, port-1 fire, left click and Space do not start it either (oracle probe).
+  **First run on real hardware (2026-11-02)**: the soft-kick disk boots KickSlopStart on a real A500 (512 KB chip +
+  512 KB slow RAM, the minimum for the `.adf`, now stated in the README). Workbench 1.2 then reached its screen, but
+  the title bar kept switching to the menu strip (right button read as pressed and released) and the pointer froze
+  while the mouse moved; no desktop icon was shown yet. Not reproduced under Amiberry (WB 1.2, 512+512 KB, 40 fast
+  right-button toggles while moving: no freeze). Suspected cause: a badly seated mouse (pin 7 +5 V, pin 9 right
+  button). To retest after reseating it; if it persists, try the same mouse on the real Kickstart 1.3, then have an
+  analysis agent probe what 1.3 writes to POTGO.
 
 ## Immediately actionable work (start of implementation, upon approval)
 

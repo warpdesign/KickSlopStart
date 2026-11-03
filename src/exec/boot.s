@@ -20,6 +20,7 @@
                 xref    build_jumptable  ; library.s
                 xref    init_memory      ; memory.s
                 xref    add_slow_memory  ; memory.s (slow RAM $C00000 at the head of the MemList)
+                xref    slow_probe       ; memory.s (end of the slow RAM, before ExecBase is built)
                 xref    init_task        ; tasks.s
                 xref    init_ints        ; interrupts.s
                 xref    dispatch_in      ; interrupts.s (M7c: launch of the 1st task = user-mode transition)
@@ -28,6 +29,7 @@
                 xref    ciaa_server      ; cia.s (PORTS/INT2 server)
                 xref    ciab_server      ; cia.s (EXTER/INT6 server, exclusive vector)
                 xref    gfx_display_init ; graphics/gfx.s (M4a: first Copper-driven display)
+                xref    exec_RawIOInit   ; exec/execmisc.s (coldstart: SERPER as in 1.3)
                 xref    strap_boot       ; exec/strap.s (M6r: boot decision -> insert-disk if not bootable)
                 xref    alert_boothook   ; exec/execmisc.s (role of alert.hook)
                 xref    kbd_selftest     ; exec/keyboard.s (F2a: CIA-A keyboard reception+decoding)
@@ -51,7 +53,7 @@
                 xref    dos_unloadseg    ; dos/loadseg.s (D2: free a seglist)
                 xref    proc_create      ; dos/process.s (D3: create a Process + pr_MsgPort)
                 xref    dos_sendpkt      ; dos/process.s (D3: send a DOS packet + WaitPort/GetMsg)
-                xref    dos_handler_df0  ; dos/handler.s (D3b: DF0: OFS file-handler process)
+                xref    dos_handler      ; dos/handler.s (D3b: floppy OFS file-handler process, one per drive)
                 xref    ls_load_hunks    ; dos/loadseg.s (D3d: parse hunks from a buffer read via dos)
                 xref    con_handler      ; dos/conhandler.s (E1: serial console handler process)
                 xref    exec_AddTail     ; exec/lists.s (ExecBase in LibList at coldstart)
@@ -155,6 +157,7 @@ TT_MICRO_REQ EQU 7000         ; M7l: 7000 REAL us (~= old rate ~140/s)
 ; The header must land at $FC0000: boot.o is the FIRST object passed to vlink
 ; (cf. Makefile), so its CODE carries the reset vector. hdr_start = offset 0 of the
 ; section; the padding uses an intra-section difference (constant in relocatable output).
+KSS_ID_LEN      EQU 64       ; must match ID_LEN in src/rom/mkrom.py
 hdr_start:
         dc.w    $1111
         dc.w    $4EF9
@@ -163,6 +166,10 @@ hdr_start:
         dc.l    $00220005        ; +0C ROM version 34.5
         dc.l    $00220002        ; +10
         dc.l    $FFFFFFFF        ; +14
+        ; +18 KickSlopStart ID block, a stable format for emulators (README "Identifying the ROM"): the magic, then a
+        ; NUL-terminated ASCII version string that mkrom.py --id writes into the zeroed field at build time.
+        dc.b    "KSS!"           ; +18
+        dcb.b   KSS_ID_LEN,0     ; +1C version string field
         dcb.b   $D0-(*-hdr_start),0
         dc.w    $4E70            ; $FC00D0 RESET (magic_reset)
 
@@ -177,6 +184,39 @@ coldstart:                        ; $FC00D2
         ; --- Phase 2: overlay off then install the stack ---
         move.b  #$03,CIAA_DDRA
         move.b  #$02,CIAA_PRA        ; OVL off -> chip RAM at $0
+        ; ColdCapture of an ExecBase that survived the reset (docs/analysis/coldstart-hardware-v34.md §5.1):
+        ; *(4) even, ChkBase, word sum of +$22..+$52 = $FFFF; the vector is cleared, then called with the return
+        ; address in a5. This is how the soft-kick image in slow RAM survives a reset.
+        move.l  ($4).w,d0
+        btst    #0,d0
+        bne.s   .cc_done
+        cmp.l   #MAXCHIP,d0          ; ExecBase in chip, or in slow RAM (where it goes when there is some)
+        blo.s   .cc_eb
+        cmp.l   #SLOW_BASE,d0
+        blo.s   .cc_done
+        cmp.l   #SLOW_BASE+SLOW_MAXBLK*SLOW_STEP,d0
+        bhs.s   .cc_done
+.cc_eb:
+        move.l  d0,a6
+        add.l   EB_CHKBASE(a6),d0
+        not.l   d0
+        bne.s   .cc_done
+        lea     EB_SOFTVER(a6),a0
+        moveq   #0,d1
+        moveq   #(EB_CHKSUM-EB_SOFTVER)/2,d0
+.cc_sum:
+        add.w   (a0)+,d1
+        dbra    d0,.cc_sum
+        not.w   d1
+        bne.s   .cc_done
+        move.l  EB_COLDCAPTURE(a6),d0
+        beq.s   .cc_done
+        clr.l   EB_COLDCAPTURE(a6)
+        move.l  d0,a0
+        lea     .cc_done(pc),a5
+        move.l  #STACKTOP,sp
+        jmp     (a0)
+.cc_done:
         move.l  #STACKTOP,sp
         lea     LOWVARS_LO,a0        ; low-RAM variables zeroed: RAM is not null at power-on on a
         move.w  #(LOWVARS_HI-LOWVARS_LO)/4-1,d0 ; real machine nor under WinUAE (an odd keyboard buffer index there
@@ -184,7 +224,7 @@ coldstart:                        ; $FC00D2
         clr.l   (a0)+
         dbra    d0,.lv_clr
         move.w  #C_BLUE,COLOR00
-        move.w  #SERPER_9600_PAL,SERPER
+        jsr     exec_RawIOInit       ; as the 1.3 coldstart does
         lea     msg_cold(pc),a0
         bsr     ser_puts
 
@@ -200,13 +240,19 @@ coldstart:                        ; $FC00D2
 
         ; --- Phase 3: ExecBase + jump table ---
         move.w  #C_CYAN,COLOR00
-        lea     EXECBASE,a0          ; zero-fill the area of the positive fields
-        move.w  #(EXEC_POSSIZE/4)-1,d0
+        jsr     slow_probe           ; d0 = end of the slow RAM (MaxExtMem) or 0
+        lea     EXECBASE,a6          ; a6 = SysBase (library base convention): low chip without slow RAM,
+        tst.l   d0
+        beq.s   .eb_at
+        lea     SLOW_BASE+SLOW_RSV+EXEC_NEGSIZE,a6 ; bottom of the slow RAM with it (coldstart-hardware-v34 §4.1)
+.eb_at:
+        move.l  a6,a0                ; zero-fill the area of the positive fields
+        move.w  #(EXEC_POSSIZE/4)-1,d1
 .zf:
         clr.l   (a0)+
-        dbf     d0,.zf
+        dbf     d1,.zf
+        move.l  d0,EB_MAXEXTMEM(a6)
 
-        lea     EXECBASE,a6          ; a6 = SysBase (library base convention)
         move.b  #NT_LIBRARY,LN_TYPE(a6)
         move.l  #exec_name,LN_NAME(a6)
         move.w  #EXEC_NEGSIZE,LIB_NEGSIZE(a6)
@@ -214,13 +260,12 @@ coldstart:                        ; $FC00D2
         move.w  #34,LIB_VERSION(a6)
         move.w  #2,LIB_REVISION(a6)
         move.l  #exec_id,LIB_IDSTRING(a6)
-        move.l  #MAXCHIP,EB_MAXLOCMEM(a6)
         move.w  #0,EB_ATTNFLAGS(a6)
         move.b  #50,EB_VBLANKFREQ(a6)
         move.b  #50,EB_POWERFREQ(a6)
         move.b  #-1,EB_IDNEST(a6)
         move.b  #-1,EB_TDNEST(a6)
-        move.l  #EXECBASE,d0
+        move.l  a6,d0
         not.l   d0
         move.l  d0,EB_CHKBASE(a6)
 
@@ -254,7 +299,7 @@ coldstart:                        ; $FC00D2
         move.l  a6,($4).w
 
         move.l  ($4).w,d0
-        cmp.l   #EXECBASE,d0
+        cmp.l   a6,d0
         bne     eb_fail
         cmp.w   #34,LIB_VERSION(a6)
         bne     eb_fail
@@ -279,6 +324,17 @@ coldstart:                        ; $FC00D2
         bsr     ser_puthex
         lea     msg_crlf(pc),a0
         bsr     ser_puts
+        if      RAMKICK
+        move.l  #coldstart,EB_COLDCAPTURE(a6) ; a reset comes back to the image in slow RAM
+        endif
+        lea     EB_SOFTVER(a6),a0    ; ChkSum: the fields +$22..+$4E are final from here on
+        moveq   #0,d1
+        moveq   #(EB_CHKSUM-EB_SOFTVER)/2-2,d0
+.cks:
+        add.w   (a0)+,d1
+        dbra    d0,.cks
+        not.w   d1
+        move.w  d1,EB_CHKSUM(a6)
         bsr     rdf_selftest         ; RawDoFmt (-522): formatting compared with an expected string
         ; --- M3a: arm VBlank and prove that the interrupt chain runs ---
         jsr     init_ints
@@ -311,6 +367,8 @@ coldstart:                        ; $FC00D2
         move.l  #127,RES_LASTPRI     ; upper bound (any RT_PRI <= 127 passes)
         clr.l   RES_COUNT
         jsr     build_reslist        ; scans [RESSCAN_LO,HI) -> ExecBase->ResModules
+        bclr    #1,CIAA_PRA          ; power LED bright (audio filter on), as 1.3 after ResModules (coldstart-hardware
+                                     ; §5): Shanghai's intro waits for CIA-A PRA == $BC, LED bit included
         moveq   #RTF_COLDSTART,d0    ; startClass: cold-start residents
         moveq   #0,d1                ; minimum version 0
         jsr     LVO_INITCODE(a6)     ; init each demo resident (emits its name in pri order)
@@ -693,8 +751,8 @@ drt_clr:
         dbra    d0,drt_clr
         move.l  a2,a6
         moveq   #0,d0
-        jsr     -6(a6)               ; AllocUnit(0) -> 1
-        cmp.l   #1,d0
+        jsr     -6(a6)               ; AllocUnit(0) -> $FF
+        cmp.l   #$FF,d0
         bne     drt_fail
         moveq   #0,d0
         jsr     -6(a6)               ; already taken -> 0
@@ -703,8 +761,8 @@ drt_clr:
         moveq   #0,d0
         jsr     -12(a6)              ; FreeUnit(0)
         moveq   #0,d0
-        jsr     -6(a6)               ; free again -> 1
-        cmp.l   #1,d0
+        jsr     -6(a6)               ; free again -> $FF
+        cmp.l   #$FF,d0
         bne     drt_fail
         moveq   #0,d0
         jsr     -12(a6)
@@ -776,8 +834,8 @@ drt_done:
         tst.w   d0
         bne     pgt_fail
         move.w  #$0C00,d0
-        jsr     -6(a6)               ; DATLY as output -> granted
-        cmp.w   #$0400,d0
+        jsr     -6(a6)               ; DATLY as output -> granted (OUTLY + DATLY)
+        cmp.w   #$0C00,d0
         bne     pgt_fail
         move.w  #$0100,d0
         jsr     -6(a6)               ; DATLX already taken -> refused
@@ -880,6 +938,54 @@ kdt_clr:
         bne     kdt_fail
         cmp.b   #NT_REPLYMSG,LN_TYPE(a3)
         bne     kdt_fail
+        moveq   #$60,d0              ; left Shift then keypad 7: qualifier $0001, then $0101 (NUMERICPAD)
+        jsr     kbd_devevent
+        moveq   #$3D,d0
+        jsr     kbd_devevent
+        move.b  #IOF_QUICK_K,IO_FLAGS(a3)
+        bsr     kdt_read
+        cmp.w   #$0001,48+IE_QUALIFIER(a3)
+        bne     kdt_fail
+        move.b  #IOF_QUICK_K,IO_FLAGS(a3)
+        bsr     kdt_read
+        cmp.w   #$3D,48+IE_CODE(a3)
+        bne     kdt_fail
+        cmp.w   #$0101,48+IE_QUALIFIER(a3)
+        bne     kdt_fail
+        move.l  #$BD,d0
+        jsr     kbd_devevent
+        move.l  #$E0,d0
+        jsr     kbd_devevent
+        bsr     kdt_clear
+        move.l  d2,-(sp)             ; 32 events (code $70, outside the matrix) into the 31-entry ring: 31 read back,
+        moveq   #31,d2               ; the last one turned into the overflow code $7D
+kdt_ovf:
+        moveq   #$70,d0
+        jsr     kbd_devevent
+        dbra    d2,kdt_ovf
+        moveq   #0,d2
+kdt_drain:
+        move.b  #IOF_QUICK_K,IO_FLAGS(a3)
+        bsr     kdt_read
+        btst    #0,IO_FLAGS(a3)
+        beq.s   kdt_dend             ; ring empty: the request stays pending
+        addq.w  #1,d2
+        bra.s   kdt_drain
+kdt_dend:
+        move.l  a3,a1
+        move.l  a2,a6
+        jsr     -36(a6)              ; AbortIO
+        move.l  ($4).w,a6
+        moveq   #0,d0
+        cmp.w   #31,d2
+        bne.s   kdt_ovres
+        cmp.w   #$7D,48+IE_CODE(a3)
+        bne.s   kdt_ovres
+        moveq   #1,d0
+kdt_ovres:
+        move.l  (sp)+,d2
+        tst.l   d0
+        beq     kdt_fail
         lea     72(a3),a0            ; reset handler: added then removed
         move.b  #NT_INTERRUPT,LN_TYPE(a0)
         move.l  a0,KDT_DATA(a3)
@@ -915,7 +1021,7 @@ kdt_done:
 kdt_matrix:
         move.w  #10,IO_COMMAND(a3)   ; KBD_READMATRIX
         move.b  #IOF_QUICK_K,IO_FLAGS(a3)
-        moveq   #16,d0
+        moveq   #13,d0           ; exactly 13 bytes (keys $00-$67)
         bra.s   kdt_rd2
 kdt_read:
         move.w  #9,IO_COMMAND(a3)    ; KBD_READEVENT
@@ -1758,8 +1864,8 @@ glt_end:
         ; --- layers.library: a SIMPLE layer (L1) and a SMART one (L2) on an off-screen 64x32x2 BitMap. Drawing,
         ; BehindLayer (simple area uncovered again: cleared + damage; hidden smart area: saved), drawing in the
         ; hidden part of L2 (read by ReadPixel), BeginUpdate/EndUpdate of L1, UpfrontLayer (restoration), MoveLayer,
-        ; SizeLayer of L2 (smart enlargement: damage), DeleteLayer (background and layer below), SizeLayer of L1,
-        ; WhichLayer. Expected: pixel-level Python model. ---
+        ; SizeLayer of L2 (smart enlargement: damage), DeleteLayer (background and layer below), SizeLayer of L1
+        ; (simple: cleared, as measured on the 1.3 ROM), WhichLayer. Expected: pixel-level Python model. ---
         movem.l d2-d7/a2-a5,-(sp)
         lea     -16(sp),sp
         move.l  sp,a5                ; 0 BitMap, 4 L1, 8 L2, 12 Layer_Info
@@ -1910,13 +2016,13 @@ glt_end:
         btst    #7,31(a0)
         beq     lyt_fail
         bsr     lyt_clrdmg
-        move.l  4(a5),a1             ; SizeLayer(L1, +8, +4)
-        moveq   #8,d0
+        move.l  4(a5),a1             ; SizeLayer(L1 simple, +8, +4): nothing kept, all cleared and damaged
+        moveq   #8,d0                ; (layers-v34 §5.7)
         moveq   #4,d1
         moveq   #-66,d7
         bsr     lyt_lcall
         LYT_PIX 35,17,0
-        LYT_PIX 5,5,3
+        LYT_PIX 5,5,0
         move.l  4(a5),a0
         btst    #7,31(a0)
         beq     lyt_fail
@@ -2115,14 +2221,13 @@ m6t_pop:
         lea     32(sp),sp            ; free the IORequest (failure)
 m6t_done:
 
-        clr.b   TD_CYLVALID         ; cylinder-tracking: head position unknown before the 1st read -> recalibrate
         ; --- M6u/M6v: raw read (B2) + MFM decoding (B3) — A SINGLE read of DF0 ---
         ; td_read_track0 reads the raw track; M6U counts the $4489 sync words (impossible in normal MFM -> 0
         ; false positives), M6V decodes the sectors (combine odd/even) + checks the header AND data checksums. A
         ; single read for both (a 2nd timeout without a disk would shift the M7A proof). Without a disk -> nothing,
         ; without FAILED.
         moveq   #0,d4                ; d4 = "disk present" flag (M6W gate: avoids a 2nd timeout without a disk)
-        bsr     td_read_track0
+        jsr     td_read_track0
         tst.l   d0
         beq     m6uv_done
         moveq   #1,d4                ; disk present
@@ -2232,7 +2337,7 @@ m6w_done:
         tst.l   d4
         beq     m6x_done
         moveq   #2,d0
-        bsr     td_read_track        ; d0 = rawbuf (track 2) | 0
+        jsr     td_read_track        ; d0 = rawbuf (track 2) | 0
         tst.l   d0
         beq     m6x_done
         move.l  d0,a4                ; a4 = rawbuf
@@ -2540,6 +2645,21 @@ d2_done:
         jsr     LVO_REMINTSERVER(a6)
         lea     msg_m7b_ok(pc),a0
         bsr     ser_puts             ; "M7B PORTS OK"
+                ifeq    PROD            ; AddIntServer/RemIntServer drive INTENA (custom-chips-v34 §3.1)
+        move.w  #INTF_COPER,INTENA   ; COPER off: adding a server must turn it on
+        moveq   #INTB_COPER,d0
+        lea     IS_STRIDE(a3),a1     ; srvB again, alone on the COPER chain
+        jsr     LVO_ADDINTSERVER(a6)
+        btst    #INTB_COPER,INTENAR+1
+        beq     m7b_fail
+        moveq   #INTB_COPER,d0
+        lea     IS_STRIDE(a3),a1
+        jsr     LVO_REMINTSERVER(a6)
+        btst    #INTB_COPER,INTENAR+1 ; chain empty again: source off
+        bne     m7b_fail
+        lea     msg_intsrv_ok(pc),a0
+        bsr     ser_puts
+                endc
 
         jsr     kbd_install          ; F2b: installs the LIVE keyboard driver (AddICRVector bit 3 -> kbd_interrupt)
         tst.l   d0
@@ -2613,6 +2733,7 @@ d2_done:
 .input_beginio:                         ; helper: BeginIO(input, a3=ioreq) + reloads SysBase. a2=device base.
         move.l  a3,a1
         move.l  a2,a6
+        move.b  #IOF_QUICK,IO_FLAGS(a1)
         jsr     -30(a6)                 ; input_beginio (LVO -30)
         move.l  ($4).w,a6               ; reload a6 = SysBase (BeginIO exits with a6 = device base)
         rts
@@ -2676,6 +2797,15 @@ d2_done:
         lea     msg_console_ok(pc),a0
         bsr     ser_puts                 ; "CONSOLE WRITE OK"
 .con_free:
+        move.l  CONB_BITMAP(a2),d0       ; the test's bitplane is returned: nothing displays the windowless console,
+        beq.s   .con_nobm                ; it would keep 10 KB of chip RAM (re-allocated if something writes there)
+        clr.l   CONB_BITMAP(a2)
+        clr.w   CONB_CURX(a2)
+        clr.w   CONB_CURY(a2)
+        move.l  d0,a1
+        move.l  #CON_BMSIZE,d0
+        jsr     LVO_FREEMEM(a6)
+.con_nobm:
         move.l  a3,a1
         move.l  #64,d0
         jsr     LVO_FREEMEM(a6)
@@ -2719,6 +2849,7 @@ d2_done:
         move.l  a0,INP_IO_DATA(a3)
         move.l  a3,a1
         move.l  a4,a6
+        move.b  #IOF_QUICK,IO_FLAGS(a1)
         jsr     -30(a6)                 ; input BeginIO WRITEEVENT
         move.l  ($4).w,a6
         clr.b   80(a3)                  ; console CMD_READ 1 byte -> must be cooked 'v'
@@ -2905,6 +3036,7 @@ d2_done:
         bra.s   .req_done
 .req_bio:                            ; helper: input BeginIO(a1=ioreq) + reloads SysBase. a4=input base.
         move.l  a4,a6
+        move.b  #IOF_QUICK,IO_FLAGS(a1)
         jsr     -30(a6)
         move.l  ($4).w,a6
         rts
@@ -2958,18 +3090,19 @@ d2_done:
         move.w  #$00FE,GP_PREV_JOY      ; movement+wrap: prev (X=$FE,Y=$00), poll JOY=$0001 (X=$01,Y=$00) -> dx=+3 dy=0
         clr.b   GP_PREV_BTN
         clr.b   GP_PREV_RBTN
+        clr.b   GP_PREV_MBTN
         clr.w   GP_CAP_N
         move.w  #$0001,d0
         move.w  #$00FF,d1               ; CIAA_PRA bit6=1 -> button released
         jsr     gp_poll
         cmp.w   #1,GP_CAP_N             ; one event (pure movement)
-        bne.s   .gp_cfree
+        bne     .gp_cfree
         cmp.w   #IECODE_NOBUTTON,GP_CAP_CODE
-        bne.s   .gp_cfree
+        bne     .gp_cfree
         cmp.w   #3,GP_CAP_DX            ; dx=+3 when crossing $FE->$01 (RED GP_NO_WRAP -> -253)
-        bne.s   .gp_cfree
+        bne     .gp_cfree
         tst.w   GP_CAP_DY               ; dy=0
-        bne.s   .gp_cfree
+        bne     .gp_cfree
         move.w  #$1234,GP_PREV_JOY      ; button edge: CONSTANT position (cur==prev -> dx=dy=0) to isolate the edge
         clr.b   GP_PREV_BTN             ; released at start
         clr.w   GP_CAP_N
@@ -2986,9 +3119,22 @@ d2_done:
         move.w  #$00FF,d1
         jsr     gp_poll
         cmp.w   #2,GP_CAP_N             ; exactly 2 events (down + up); RED GP_NO_EDGE -> 3
-        bne.s   .gp_cfree
+        bne     .gp_cfree
         cmp.w   #(IECODE_LBUTTON|IECODE_UP_PREFIX),GP_CAP_CODE  ; last = up ($E8)
-        bne.s   .gp_cfree
+        bne     .gp_cfree
+        clr.w   GP_CAP_N
+        move.w  #$1234,d0               ; E: middle pressed (DATLX) -> MBUTTON down
+        move.w  #$02FF,d1
+        jsr     gp_poll
+        cmp.w   #IECODE_MBUTTON,GP_CAP_CODE
+        bne     .gp_cfree
+        move.w  #$1234,d0               ; F: middle released -> MBUTTON up
+        move.w  #$00FF,d1
+        jsr     gp_poll
+        cmp.w   #2,GP_CAP_N
+        bne     .gp_cfree
+        cmp.w   #(IECODE_MBUTTON|IECODE_UP_PREFIX),GP_CAP_CODE
+        bne     .gp_cfree
         lea     msg_gameport_ok(pc),a0
         bsr     ser_puts                ; "GAMEPORT OK"
 .gp_cfree:
@@ -3004,6 +3150,7 @@ d2_done:
         bra.s   .gp_done
 .gp_bio:                                ; input BeginIO(a1=ioreq) + reloads SysBase. a4=input base.
         move.l  a4,a6
+        move.b  #IOF_QUICK,IO_FLAGS(a1)
         jsr     -30(a6)
         move.l  ($4).w,a6
         rts
@@ -3109,6 +3256,7 @@ d2_done:
         move.l  a0,INP_IO_DATA(a1)
 .m6r_bio:
         move.l  a4,a6
+        move.b  #IOF_QUICK,IO_FLAGS(a1)
         jsr     -30(a6)
         move.l  ($4).w,a6
         rts
@@ -3194,7 +3342,7 @@ d2_done:
         ; RED STRAP_FAKE_BOOTDEV: d0!=0 without reading -> M6Y present but CBOOT absent. RED STRAP_NO_EXEC: validates
         ; but does not jump -> CBOOT absent, M6Y present. RED STRAP_BAD_CSUM: rejects a good block -> M6R.
         jsr     alert_boothook       ; alert.hook: Guru of a dead-end alert from before the reset, before the strap
-        bsr     strap_boot
+        jsr     strap_boot
         tst.l   d0
         bne.s   .m6r_floppy
         jsr     strap_romboot        ; DF0: not bootable: BootPoint of the boards (a BootPoint that starts dos jumps to
@@ -3212,7 +3360,22 @@ d2_done:
         jsr     proc_create
         bra.s   boot_strap_done
 .m6r_floppy:
+        move.l  a0,-(sp)
         jsr     dos_df0bootnode      ; DF0: BootNode (pri 5) in eb_MountList, as after a 1.3 bootblock
+        move.l  ($4).w,a6
+        lea     dos_libname,a1
+        jsr     LVO_FINDRESIDENT(a6)
+        move.l  (sp)+,a0             ; entry returned by the bootblock (uae-hd-boot-v34 §3 item 2)
+        cmp.w   #0,a0
+        beq.s   boot_dos_start       ; no entry (RED STRAP_NO_EXEC)
+        tst.l   d0
+        beq.s   .bb_game
+        move.l  d0,a1
+        cmp.l   RT_INIT(a1),a0
+        beq.s   boot_dos_start       ; the dos init: dos starts on DF0: (what dos_rtinit would do)
+.bb_game:
+        move.w  #$2000,sr            ; a game loaded by its own bootblock: it runs in supervisor with the
+        jmp     (a0)                 ; interrupts it relies on enabled (1.3: IPL 3 seen, never 7)
 ; boot_dos_start: dos startup (after a DF0: bootblock, or from the rt_Init of dos.library called by the
 ; BootPoint of a board): mount list -> boot device, then Initial CLI. Does not return.
 boot_dos_start:
@@ -3909,7 +4072,7 @@ setup_demo_tasks:                    ; a6 = SysBase; clobbers scratch + d2/a2-a4
         ; --- D3b: create the DF0: file-handler process (OFS) — INFRASTRUCTURE (the CLI resolves DF0: through it). The
         ; fs-driver that follows is a PROOF CLIENT (reads "kickslop" -> "D3B HANDLER OK") -> gated in prod. ---
         lea     d3b_hname(pc),a0
-        move.l  #dos_handler_df0,a1  ; absolute: handler.o linked out of 16-bit lea(pc) range
+        move.l  #dos_handler,a1      ; absolute: handler.o linked out of 16-bit lea(pc) range
         moveq   #6,d0
         move.l  #D3_STK,d1
         jsr     proc_create
@@ -3928,30 +4091,11 @@ setup_demo_tasks:                    ; a6 = SysBase; clobbers scratch + d2/a2-a4
         tst.l   d0
         beq     .d3c_noclient        ; no dos.library (should not happen) -> no client
         move.l  d0,a2                ; a2 = DosBase
-        move.l  #DN_SIZEOF+4+FSSM_SIZEOF,d0  ; + BSTR "DF0" + FileSysStartupMsg (long-aligned: BPTR)
-        move.l  #(MEMF_PUBLIC|MEMF_CLEAR),d1
-        jsr     LVO_ALLOCMEM(a6)
-        tst.l   d0
+        move.l  DOS_FSPORT,d0        ; dn_Task = port of the OFS file-handler process
+        moveq   #0,d1
+        bsr     fl_node
         beq     .d3c_noclient
-        move.l  d0,a3                ; a3 = DeviceNode (dn_Type = DLT_DEVICE = 0 via MEMF_CLEAR)
-        move.l  DOS_FSPORT,DN_TASK(a3)   ; dn_Task = port of the OFS file-handler process
-        move.l  #$03444630,DN_SIZEOF(a3) ; BSTR: length 3, "DF0"
-        lea     DN_SIZEOF(a3),a0
-        move.l  a0,d0
-        lsr.l   #2,d0
-        move.l  d0,DN_NAME(a3)       ; dn_Name -> dos resolves "DF0:" through this node
-        lea     DN_SIZEOF+4(a3),a0   ; FileSysStartupMsg: unit 0 (MEMF_CLEAR), "trackdisk.device", DD geometry
-        lea     df0_device(pc),a1
-        move.l  a1,d0
-        lsr.l   #2,d0
-        move.l  d0,FSSM_DEVICE(a0)
-        lea     df0_environ(pc),a1
-        move.l  a1,d0
-        lsr.l   #2,d0
-        move.l  d0,FSSM_ENVIRON(a0)
-        move.l  a0,d0
-        lsr.l   #2,d0
-        move.l  d0,DN_STARTUP(a3)
+        move.l  a0,a3                ; a3 = DeviceNode of DF0:
         move.l  DL_ROOT(a2),a0       ; RootNode (APTR)
         move.l  RN_INFO(a0),d0       ; BPTR DosInfo
         lsl.l   #2,d0
@@ -3959,6 +4103,7 @@ setup_demo_tasks:                    ; a6 = SysBase; clobbers scratch + d2/a2-a4
         move.l  a3,d0
         lsr.l   #2,d0                ; BPTR(DeviceNode)
         move.l  d0,DI_DEVINFO(a0)    ; di_DevInfo = BPTR(DeviceNode) -> dos Open resolves DF0: through this node
+        bsr     mount_df1
                 ifeq    PROD            ; PROD: D3 test clients (d3c..d3j read kickslop/D3DTest/bigseg/BigData,
                                         ; absent from a real Workbench disk) -> out of prod; the DF0: MOUNT above stays
         lea     d3c_cname(pc),a0
@@ -4848,16 +4993,24 @@ task_semr:
 ; task_aud: real CMD_WRITE on channel 0 (volume 0: DMA and interrupts without audible sound). w1 then w2 (30 cycles
 ; each) queued; ADCMD_WAITCYCLE must be returned before w1 (end of the 1st cycle), w1 before w2 (chaining
 ; through the queue), CMD_READ returns w1 during playback then 0, and the channel's DMA is cut at the end.
-; Stack: 3 IOAudio (ioa1 = commands, w1, w2). d5 = order findings (b0 WAITCYCLE before w1, b1 w1 before w2).
+; The three replies go to a PA_IGNORE port, whose queue keeps their order: the check does not depend on how
+; often this task runs while the stress tasks of the dev ROM hold Forbid (polling a ~210 ms window did).
+; Stack: 3 IOAudio (ioa1 = commands, w1, w2) + the reply port at TA_PORT.
+TA_PORT         EQU 216
+TA_FRAME        EQU TA_PORT+MP_SIZE+2
 task_aud:
         move.l  ($4).w,a6
-        lea     -216(sp),sp
+        lea     -TA_FRAME(sp),sp
         move.l  sp,a3
         move.l  a3,a0
-        moveq   #53,d0
+        moveq   #TA_FRAME/4-1,d0
 .ta_clr:
         clr.l   (a0)+
         dbra    d0,.ta_clr
+        lea     TA_PORT(a3),a1
+        move.b  #PA_IGNORE,MP_FLAGS(a1)
+        lea     MP_MSGLIST(a1),a1
+        jsr     newlist
         moveq   #64,d0
         move.l  #MEMF_CHIP|MEMF_CLEAR,d1
         jsr     LVO_ALLOCMEM(a6)
@@ -4896,32 +5049,35 @@ task_aud:
         bne     .ta_failp
         move.l  a3,a1                ; ADCMD_WAITCYCLE (asynchronous)
         move.b  #NT_MESSAGE,LN_TYPE(a1)
+        lea     TA_PORT(a3),a0
+        move.l  a0,MN_REPLYPORT(a1)
         clr.b   IO_FLAGS(a1)
         move.w  #14,IO_COMMAND(a1)
         bsr     aut_io
         jsr     LVO_PERMIT(a6)
-        moveq   #0,d5
-        move.l  #2000000,d4
+        move.l  #2000000,d4          ; bound on the wait for w2 (playback ~430 ms)
 .ta_poll:
-        cmp.b   #NT_REPLYMSG,LN_TYPE(a3)
-        bne.s   .ta_p1
-        cmp.b   #NT_REPLYMSG,LN_TYPE+72(a3)
-        beq.s   .ta_p1
-        bset    #0,d5                ; WAITCYCLE returned, w1 still in progress
-.ta_p1:
-        cmp.b   #NT_REPLYMSG,LN_TYPE+72(a3)
-        bne.s   .ta_p2
-        cmp.b   #NT_REPLYMSG,LN_TYPE+144(a3)
-        beq.s   .ta_p2
-        bset    #1,d5                ; w1 returned, w2 still in progress
-.ta_p2:
         cmp.b   #NT_REPLYMSG,LN_TYPE+144(a3)
         beq.s   .ta_end
         subq.l  #1,d4
         bne.s   .ta_poll
         bra     .ta_fail
 .ta_end:
-        cmp.b   #3,d5
+        moveq   #0,d5                ; replies in the port's order: WAITCYCLE, w1, w2, nothing else
+.ta_order:
+        lea     TA_PORT(a3),a0
+        jsr     LVO_GETMSG(a6)
+        move.l  d5,d1
+        mulu    #72,d1
+        add.l   a3,d1
+        cmp.l   d1,d0
+        bne     .ta_fail
+        addq.w  #1,d5
+        cmp.w   #3,d5
+        bne.s   .ta_order
+        lea     TA_PORT(a3),a0
+        jsr     LVO_GETMSG(a6)
+        tst.l   d0
         bne     .ta_fail
         tst.b   IO_ERROR+72(a3)
         bne     .ta_fail
@@ -4959,7 +5115,7 @@ task_aud:
         moveq   #64,d0
         jsr     LVO_FREEMEM(a6)
 .ta_fail0:
-        lea     216(sp),sp
+        lea     TA_FRAME(sp),sp
         rts
 ; .ta_mkw: a1 = IOAudio to prepare as a CMD_WRITE of d2 cycles (period 400, volume 0, ADIOF_PERVOL).
 .ta_mkw:
@@ -4969,6 +5125,8 @@ task_aud:
         move.w  #3,IO_COMMAND(a1)
         move.b  #$10,IO_FLAGS(a1)
         move.b  #NT_MESSAGE,LN_TYPE(a1)
+        lea     TA_PORT(a3),a0
+        move.l  a0,MN_REPLYPORT(a1)
         move.l  a4,AUT_DATA(a1)
         moveq   #64,d0
         move.l  d0,AUT_LENGTH(a1)
@@ -4976,6 +5134,81 @@ task_aud:
         clr.w   AUT_VOLUME(a1)
         move.w  d2,AUT_CYCLES(a1)
         rts
+
+; fl_node(d0 = port of the file-handler, d1 = trackdisk unit, a6) -> a0 = DeviceNode "DF<unit>" (dn_Type =
+; DLT_DEVICE, FileSysStartupMsg: unit, "trackdisk.device", DD geometry), not linked; Z = 1 if no memory.
+; Clobbers d0/d1/a1.
+fl_node:
+        movem.l d2-d3,-(sp)
+        move.l  d0,d2
+        move.l  d1,d3
+        move.l  #DN_SIZEOF+4+FSSM_SIZEOF,d0  ; + BSTR "DFn" + FileSysStartupMsg (long-aligned: BPTR)
+        move.l  #(MEMF_PUBLIC|MEMF_CLEAR),d1
+        jsr     LVO_ALLOCMEM(a6)
+        tst.l   d0
+        beq.s   .fn_ret
+        move.l  d0,a0                ; dn_Type = DLT_DEVICE = 0 via MEMF_CLEAR
+        move.l  d2,DN_TASK(a0)
+        move.l  #$03444630,d0        ; BSTR: length 3, "DF0" + unit
+        add.l   d3,d0
+        move.l  d0,DN_SIZEOF(a0)
+        lea     DN_SIZEOF(a0),a1
+        move.l  a1,d0
+        lsr.l   #2,d0
+        move.l  d0,DN_NAME(a0)       ; dn_Name -> dos resolves "DFn:" through this node
+        lea     DN_SIZEOF+4(a0),a1   ; FileSysStartupMsg
+        move.l  d3,FSSM_UNIT(a1)
+        lea     df0_device(pc),a1
+        move.l  a1,d0
+        lsr.l   #2,d0
+        move.l  d0,DN_SIZEOF+4+FSSM_DEVICE(a0)
+        lea     df0_environ(pc),a1
+        move.l  a1,d0
+        lsr.l   #2,d0
+        move.l  d0,DN_SIZEOF+4+FSSM_ENVIRON(a0)
+        lea     DN_SIZEOF+4(a0),a1
+        move.l  a1,d0
+        lsr.l   #2,d0
+        move.l  d0,DN_STARTUP(a0)    ; Z = 0
+.fn_ret:
+        movem.l (sp)+,d2-d3          ; (movem does not touch the CCR)
+        rts
+
+; mount_df1(a3 = DeviceNode of DF0:, a6): if disk.resource identified a 3.5" drive as unit 1 (HRM external-drive
+; protocol, read at its startup), a second file-handler process and its "DF1" DeviceNode, linked after DF0:. The
+; handler takes its unit from the node (dn_Task = its port), linked before it first runs. Preserves everything.
+mount_df1:
+        movem.l d0-d1/a0-a1,-(sp)
+        lea     diskres_test_name(pc),a1
+        jsr     LVO_OPENRESOURCE(a6)
+        tst.l   d0
+        beq.s   .m1_ret
+        move.l  a6,-(sp)
+        move.l  d0,a6
+        moveq   #1,d0
+        jsr     -30(a6)              ; GetUnitID(1) (disk.resource LVO -30)
+        move.l  (sp)+,a6
+        tst.l   d0                   ; DRT_AMIGA = 0
+        bne.s   .m1_ret
+        lea     df1_hname(pc),a0
+        move.l  #dos_handler,a1
+        moveq   #6,d0
+        move.l  #D3_STK,d1
+        jsr     proc_create
+        tst.l   d0
+        beq.s   .m1_ret
+        moveq   #1,d1
+        bsr     fl_node
+        beq.s   .m1_ret
+        move.l  a0,d0
+        lsr.l   #2,d0
+        move.l  d0,DN_NEXT(a3)
+.m1_ret:
+        movem.l (sp)+,d0-d1/a0-a1
+        rts
+df1_hname:
+        dc.b    "dos.handler.df1",0
+        even
 
 ; mk_demo_task: a2 = PC of the body, a3 = name, d2.b = priority -> a4 = created TCB.
 ; AllocMem preserves a2/a3/d2; AddTask reads a2 (initPC) / a3 (finalPC=task_exit).
@@ -5043,7 +5276,7 @@ task_l:                              ; low priority, never blocks
         moveq   #1,d0
         moveq   #DEMO_SIG,d1
         lsl.l   d1,d0
-        jsr     LVO_SIGNAL(a6)       ; wakes task_H + sets AttnResched (pri 10 > 0)
+        jsr     LVO_SIGNAL(a6)       ; wakes task_H + sets SAR (pri 10 > 0)
         jsr     LVO_PERMIT(a6)       ; <- YIELD: dispatches task_H immediately
         cmp.l   #SENT_L,d7
         bne.w   demo_fail
@@ -5078,7 +5311,7 @@ task_fb:
         move.l  #1,FORBID_TEST_FLAG  ; "I ran" (observed by task_fa)
         bra.s   .fb_loop
 
-; task_fa (pri 3, Forbid atomicity proof): takes Forbid, wakes task_fb (pri 7 > 3 -> arms AttnResched),
+; task_fa (pri 3, Forbid atomicity proof): takes Forbid, wakes task_fb (pri 7 > 3 -> arms SAR),
 ; waits 2 VBlanks UNDER Forbid (guarantees >= 1 IRQ exit during the Forbid, where intr_isr_defer could switch).
 ; If FORBID_TEST_FLAG stayed 0 -> task_fb did NOT preempt under Forbid -> "FORBID ATOMIC OK". Runs ONCE
 ; then blocks (no hogging). RED SCHED_NO_FORBID_GATE: fb preempts during the Forbid -> flag=1 -> absent.
@@ -5086,7 +5319,7 @@ task_fa:
         move.l  ($4).w,a6
         jsr     LVO_FORBID(a6)       ; atomic output section to be proven
         clr.l   FORBID_TEST_FLAG
-        move.l  FB_TASK,a1           ; wakes task_fb (pri 7 > current 3 -> exec_Signal sets AttnResched)
+        move.l  FB_TASK,a1           ; wakes task_fb (pri 7 > current 3 -> exec_Signal sets SAR)
         moveq   #1,d0
         moveq   #FB_SIG,d1
         lsl.l   d1,d0
@@ -5605,11 +5838,12 @@ disk_watch:
         jsr     LVO_SUPERVISOR(a6)   ; does not return
         bra.s   .dw_lp
 ; dw_reboot (supervisor): RESET reinitialises the chips (the overlay puts the ROM back at $0); the JMP must be in the
-; same long word as the RESET (already prefetched). Entry = initial PC of the ROM (long at $FC0004).
+; same long word as the RESET (already prefetched). Entry = initial PC of our image (long at ROMBASE+4: the ROM,
+; or slow RAM for the soft-kick image, which RESET does not touch).
         cnop    0,4
 dw_reboot:
         move.w  #$2700,sr
-        move.l  ($FC0004).l,a0
+        move.l  (ROMBASE+4).l,a0
         bra.s   dw_rst
         cnop    0,4
 dw_rst:
@@ -5640,6 +5874,7 @@ ptr_wire:
         move.w  #IND_ADDHANDLER,IO_COMMAND(a1)
         move.l  #PTR_INT,INP_IO_DATA(a1)
         move.l  a4,a6
+        move.b  #IOF_QUICK,IO_FLAGS(a1)
         jsr     -30(a6)
         move.l  ($4).w,a6
         lea     48(sp),sp
@@ -5712,6 +5947,7 @@ m6r_wire_requester:
 .mw_bio:
         move.l  a2,a1
         move.l  a4,a6
+        move.b  #IOF_QUICK,IO_FLAGS(a1)
         jsr     -30(a6)
         move.l  ($4).w,a6
         rts
@@ -5910,7 +6146,11 @@ task_q2_name:
 task_rm_name:
         dc.b    "demo.rm",0
 msg_cold:
+        if      RAMKICK
+        dc.b    "EXEC coldstart: overlay off, stack live (RAM)",13,10,0
+        else
         dc.b    "EXEC coldstart: overlay off, stack live",13,10,0
+        endif
 msg_f2kbd:
         dc.b    "F2 KBD OK (CIA-A keyboard: power-up stream received+decoded, $FD initiate + $FE terminate; handshake drives the stream)",13,10,0
 msg_f2bkbd:
@@ -5936,7 +6176,7 @@ msg_req_drawn:
 msg_req_click:
         dc.b    "REQUESTER CLICK OK (RAWMOUSE via input.device: click inside gadget -> hit, click outside -> miss)",13,10,0
 msg_gameport_ok:
-        dc.b    "GAMEPORT OK (gameport.device logic: gp_delta8 8-bit wraparound, button edge-detect, RAWMOUSE emitted via IND_WRITEEVENT)",13,10,0
+        dc.b    "GAMEPORT OK (gameport.device logic: gp_delta8 8-bit wraparound, left and middle button edge-detect, RAWMOUSE emitted via IND_WRITEEVENT)",13,10,0
 msg_m6r_live_ok:
         dc.b    "M6R LIVE OK (relative RAWMOUSE deltas -> pointer accumulator -> absolute clamped pos -> requester hit-test: on gadget -> hit, off -> miss)",13,10,0
 msg_gp_live_ok:
@@ -5995,6 +6235,11 @@ msg_m6a_ok:
         dc.b    "M6A TIMER OK (VBLANK unit: request replied after ~5 ticks)",13,10,0
 msg_m6a_fail:
         dc.b    "M6A FAILED: timer VBLANK unit incorrect",13,10,0
+                ifeq    PROD
+msg_intsrv_ok:
+        dc.b    "INTSRV INTENA OK (AddIntServer enables the source, RemIntServer of the last server disables it)",13,10,0
+        even
+                endc
 msg_m7b_ok:
         dc.b    "M7B PORTS OK (per-number dispatch: AddIntServer chain, 2 servers in pri order)",13,10,0
 msg_m7b_fail:
@@ -6226,7 +6471,7 @@ msg_audio_fail:
 kbddev_test_name:
         dc.b    "keyboard.device",0
 msg_kbddev_ok:
-        dc.b    "KBDDEV OK (keyboard.device: READMATRIX, READEVENT buffered + pending replied by event, CMD_CLEAR, AbortIO, ADD/REMRESETHANDLER)",13,10,0
+        dc.b    "KBDDEV OK (keyboard.device: READMATRIX, READEVENT buffered + pending replied by event, CMD_CLEAR, AbortIO, NUMERICPAD qualifier, ring overflow $7D, ADD/REMRESETHANDLER)",13,10,0
 msg_kbddev_fail:
         dc.b    "KBDDEV FAIL",13,10,0
 potgo_test_name:

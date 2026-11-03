@@ -25,6 +25,7 @@
                 xdef    exec_AddMemList
                 xdef    init_memory
                 xdef    add_slow_memory
+                xdef    slow_probe
 
 ; Allocate(memHeader a0, byteSize d0) -> d0 = block | 0: first-fit + split within the chunks of ONE MemHeader, size
 ; rounded to 8 bytes (AutoDoc: the caller protects the header, Forbid or semaphore). Clobbers d1/a0/a1.
@@ -112,7 +113,8 @@ exec_AllocMem:
         moveq   #0,d0
 .am_exit:
                 ifd     MEMTRACK
-        bsr     mt_alloc             ; d0 = block | 0, d2 = size
+        move.l  28(sp),d4            ; caller of AllocMem (above the saved d2-d5/a2-a4)
+        bsr     mt_allocc            ; d0 = block | 0, d2 = size, d4 = caller
                 endc
         jsr     LVO_PERMIT(a6)       ; Permit does not touch d0
         movem.l (sp)+,d2-d5/a2-a4
@@ -364,11 +366,34 @@ exec_TypeOfMem:
         jsr     LVO_PERMIT(a6)       ; preserves d0
         rts
 
-; init_memory: chip MemHeader @ MH_CHIP + initial chunk covering the heap
+; init_memory: sizes the chip RAM, then chip MemHeader @ MH_CHIP + initial chunk covering the heap.
+; Sizing as on 1.3 (spec coldstart-hardware-v34.md §2): a long written at each 4 KB boundary must read back while
+; the sentinel long at $0 stays 0 (a mirror of a smaller chip wraps onto $0), up to 2 MB. The first MAXCHIP bytes
+; are assumed: they already hold ExecBase, the stack and the low variables.
+CHIP_LIMIT      EQU $00200000
+CHIP_STEP       EQU $00001000
+CHIP_PATTERN    EQU $5AA5C33C
 init_memory:                         ; a6 = SysBase (jump table already built)
                 ifd     MEMTRACK
         clr.l   MT_TABLE             ; low RAM not cleared at reset
                 endc
+        move.l  #MAXCHIP,d1          ; d1 = chip size
+        clr.l   ($0).w
+.im_size:
+        cmp.l   #CHIP_LIMIT,d1
+        beq.s   .im_sized
+        move.l  d1,a1
+        move.l  #CHIP_PATTERN,(a1)
+        tst.l   ($0).w
+        bne.s   .im_mirror
+        cmp.l   #CHIP_PATTERN,(a1)
+        bne.s   .im_sized
+        add.l   #CHIP_STEP,d1
+        bra.s   .im_size
+.im_mirror:
+        clr.l   ($0).w
+.im_sized:
+        move.l  d1,EB_MAXLOCMEM(a6)
         lea     MH_CHIP,a0
         moveq   #7,d0                ; 32 bytes to zero
         move.l  a0,a1
@@ -380,82 +405,93 @@ init_memory:                         ; a6 = SysBase (jump table already built)
         move.l  #mh_name,LN_NAME(a0)
         move.w  #(MEMF_CHIP|MEMF_PUBLIC),MH_ATTRIBUTES(a0)
         move.l  #HEAP_LOWER,MH_LOWER(a0)
-        move.l  #HEAP_UPPER,MH_UPPER(a0)
-        move.l  #(HEAP_UPPER-HEAP_LOWER),MH_FREE(a0)
+        move.l  d1,MH_UPPER(a0)
+        sub.l   #HEAP_LOWER,d1
+        move.l  d1,MH_FREE(a0)
         move.l  #HEAP_LOWER,a1       ; initial chunk = the whole heap
         clr.l   MC_NEXT(a1)
-        move.l  #(HEAP_UPPER-HEAP_LOWER),MC_BYTES(a1)
+        move.l  d1,MC_BYTES(a1)
         move.l  a1,MH_FIRST(a0)
         lea     EB_MEMLIST(a6),a0    ; AddTail(MemList, MemHeader)
         lea     MH_CHIP,a1
         jsr     LVO_ADDTAIL(a6)
         rts
 
-; add_slow_memory: detects the A500 "slow" RAM (trapdoor, $C00000..) and adds it AT THE HEAD of the MemList
+; slow_probe: detects the A500 "slow" RAM (trapdoor, $C00000..). Called by coldstart BEFORE ExecBase is built,
+; since ExecBase goes into that RAM when it exists. Without slow RAM, the area may mirror the custom registers
+; ($DFF000, partial decoding): each probe is at offset $1FE/$3FE of a block (= NO-OP register if mirrored ->
+; harmless write). Two crossed patterns written to TWO addresses before reading back: a floating bus that retains
+; the last written value does not pass. Following blocks: rejected if alias of block 0 (incomplete decoding).
+; RAMKICK: the image occupies the first SLOW_RSV bytes, so the probes start above it.
+; Returns d0 = end of the slow RAM (the MaxExtMem value), 0 = none. Clobbers d1/a0/a1.
+slow_probe:
+        moveq   #0,d0                ; d0 = detected size
+.sp_blk:
+        cmp.l   #(SLOW_MAXBLK*SLOW_STEP),d0
+        beq.s   .sp_end
+        lea     SLOW_BASE+SLOW_RSV,a0
+        add.l   d0,a0                ; a0 = candidate block (+ reserved image area)
+        move.w  #$5A3C,$1FE(a0)
+        move.w  #$A5C3,$3FE(a0)
+        cmp.w   #$5A3C,$1FE(a0)
+        bne.s   .sp_end
+        move.w  #$A5C3,$1FE(a0)
+        move.w  #$5A3C,$3FE(a0)
+        cmp.w   #$A5C3,$1FE(a0)
+        bne.s   .sp_end
+        tst.l   d0                   ; block 0: no alias possible
+        beq.s   .sp_ok
+        lea     SLOW_BASE+SLOW_RSV,a1
+        move.w  #$1234,$1FE(a1)      ; mark block 0...
+        move.w  #$4321,$1FE(a0)      ; ...write the current block...
+        cmp.w   #$1234,$1FE(a1)      ; ...has block 0 changed? -> alias
+        bne.s   .sp_end
+.sp_ok:
+        add.l   #SLOW_STEP,d0
+        bra.s   .sp_blk
+.sp_end:
+        tst.l   d0
+        beq.s   .sp_ret
+        add.l   #SLOW_BASE,d0
+.sp_ret:
+        rts
+
+; add_slow_memory: adds the slow RAM found by slow_probe (ExecBase MaxExtMem) AT THE HEAD of the MemList
 ; (MEMF_FAST|MEMF_PUBLIC) -> allocations without MEMF_CHIP go there first; chip stays for DMA. A game that
 ; requests ~400 KB of CHIP (Lemmings) only fits under this condition on a 512K chip + 512K slow config.
-; Without slow RAM, the area may mirror the custom registers ($DFF000, partial decoding): each probe is at
-; offset $1FE/$3FE of a block (= NO-OP register if mirrored -> harmless write). Two crossed patterns written
-; to TWO addresses before reading back: a floating bus that retains the last written value does not pass.
-; Following blocks: rejected if alias of block 0 (incomplete decoding). a6 = SysBase. Called after the memory
-; selftest (which assumes chip at the head of the list). Returns d0 = bytes of slow RAM detected (0 = none).
-SLOW_BASE       EQU $00C00000
-SLOW_STEP       EQU $00080000        ; 512 KB granularity
-SLOW_MAXBLK     EQU 3                ; up to 1.5 MB ($C00000-$D7FFFF)
+; ExecBase sits at the bottom of that RAM, so the MemHeader starts right after its positive part. a6 = SysBase.
+; Called after the memory selftest (which assumes chip at the head of the list). Returns d0 = bytes of slow RAM
+; (0 = none).
 add_slow_memory:
-        movem.l d2-d4/a2-a3,-(sp)
-        moveq   #0,d2                ; d2 = detected size
-.as_blk:
-        cmp.l   #(SLOW_MAXBLK*SLOW_STEP),d2
-        beq.s   .as_add
-        lea     SLOW_BASE,a2
-        add.l   d2,a2                ; a2 = candidate block
-        move.w  #$5A3C,$1FE(a2)
-        move.w  #$A5C3,$3FE(a2)
-        cmp.w   #$5A3C,$1FE(a2)
-        bne.s   .as_add
-        move.w  #$A5C3,$1FE(a2)
-        move.w  #$5A3C,$3FE(a2)
-        cmp.w   #$A5C3,$1FE(a2)
-        bne.s   .as_add
-        tst.l   d2                   ; block 0: no alias possible
-        beq.s   .as_ok
-        lea     SLOW_BASE,a3
-        move.w  #$1234,$1FE(a3)      ; mark block 0...
-        move.w  #$4321,$1FE(a2)      ; ...write the current block...
-        cmp.w   #$1234,$1FE(a3)      ; ...has block 0 changed? -> alias
-        bne.s   .as_add
-.as_ok:
-        add.l   #SLOW_STEP,d2
-        bra.s   .as_blk
-.as_add:
-        move.l  d2,d4                ; d4 = detected size (return value)
-        beq.s   .as_ret              ; no slow RAM: nothing to do
-        lea     SLOW_BASE,a0         ; MemHeader at the start of the area, 1st chunk right after
-        moveq   #(MH_SIZE/4)-1,d0
+        move.l  EB_MAXEXTMEM(a6),d0
+        beq.s   .as_ret
+        move.l  d0,-(sp)
+        lea     EXEC_POSSIZE+7(a6),a0
+        move.l  a0,d1
+        and.w   #$FFF8,d1
+        move.l  d1,a0                ; a0 = MemHeader, 1st chunk right after
+        moveq   #(MH_SIZE/4)-1,d1
         move.l  a0,a1
 .as_z:
         clr.l   (a1)+
-        dbf     d0,.as_z
+        dbf     d1,.as_z
         move.b  #NT_MEMORY,LN_TYPE(a0)
         move.l  #slow_name,LN_NAME(a0)
         move.w  #(MEMF_FAST|MEMF_PUBLIC),MH_ATTRIBUTES(a0)
         lea     MH_SIZE(a0),a1       ; a1 = 1st chunk
         move.l  a1,MH_LOWER(a0)
         move.l  a1,MH_FIRST(a0)
-        move.l  d2,d3
-        add.l   a0,d3
-        move.l  d3,MH_UPPER(a0)
-        sub.l   #MH_SIZE,d2          ; d2 = free bytes
-        move.l  d2,MH_FREE(a0)
+        move.l  d0,MH_UPPER(a0)
+        sub.l   a1,d0                ; d0 = free bytes
+        move.l  d0,MH_FREE(a0)
         clr.l   MC_NEXT(a1)
-        move.l  d2,MC_BYTES(a1)
+        move.l  d0,MC_BYTES(a1)
         move.l  a0,a1                ; AddHead(MemList, header)
         lea     EB_MEMLIST(a6),a0
         jsr     LVO_ADDHEAD(a6)
+        move.l  (sp)+,d0
+        sub.l   #SLOW_BASE,d0
 .as_ret:
-        move.l  d4,d0
-        movem.l (sp)+,d2-d4/a2-a3
         rts
 
 slow_name:
@@ -467,20 +503,27 @@ mh_name:
         EVEN
 
                 ifd     MEMTRACK
-; --- allocation tracer (diagnostic ROM, -DMEMTRACK=1): each successful AllocMem is recorded (address, size) in
+; --- allocation tracer (diagnostic ROM, -DMEMTRACK=1): each successful AllocMem is recorded (address, size, caller) in
 ; a table of MT_N entries (AllocAbs too); each FreeMem is looked up in it: different size -> "MTSZ address returned-size
 ; recorded-size caller", unknown address -> "MTUNK address size caller". Under Forbid (callers).
 MT_N            EQU 3000
-; mt_alloc(d0 = block | 0, d2 = size, a6): preserves everything.
+; mt_alloc(d0 = block | 0, d2 = size, a6) / mt_allocc (same, d4 = caller): preserve everything. Entries of
+; 12 bytes: address, size, caller (0 for AllocAbs); the blocks still allocated stay in the table (debugger dump).
 mt_alloc:
+        move.l  d4,-(sp)
+        moveq   #0,d4
+        bsr.s   mt_allocc
+        move.l  (sp)+,d4
+        rts
+mt_allocc:
         movem.l d0-d1/a0-a1,-(sp)
         tst.l   d0
         beq.s   .ma_ret
         move.l  MT_TABLE,d1
         bne.s   .ma_have
-        cmp.l   #MT_N*8,d2           ; the table itself (allocated below) is not recorded
+        cmp.l   #MT_N*12,d2          ; the table itself (allocated below) is not recorded
         beq.s   .ma_ret
-        move.l  #MT_N*8,d0
+        move.l  #MT_N*12,d0
         move.l  #MEMF_CHIP|MEMF_CLEAR,d1
         jsr     LVO_ALLOCMEM(a6)
         move.l  d0,MT_TABLE
@@ -493,12 +536,13 @@ mt_alloc:
 .ma_lp:
         tst.l   (a0)
         beq.s   .ma_put
-        addq.l  #8,a0
+        lea     12(a0),a0
         dbra    d1,.ma_lp
         bra.s   .ma_ret              ; table full
 .ma_put:
         move.l  d0,(a0)+
-        move.l  d2,(a0)
+        move.l  d2,(a0)+
+        move.l  d4,(a0)
 .ma_ret:
         movem.l (sp)+,d0-d1/a0-a1
         rts
@@ -512,7 +556,7 @@ mt_free:
 .mf_lp:
         cmp.l   (a0),a1
         beq.s   .mf_found
-        addq.l  #8,a0
+        lea     12(a0),a0
         dbra    d1,.mf_lp
         lea     mt_unk(pc),a0        ; address never allocated (or already returned)
         jsr     ser_puts

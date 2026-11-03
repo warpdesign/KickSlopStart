@@ -20,6 +20,12 @@ PR_RETURNADDR    EQU 176           ; 0xB0: APTR
 PR_PKTWAIT       EQU 180           ; 0xB4: APTR
 PR_WINDOWPTR     EQU 184           ; 0xB8: APTR (last V34 field)
 PR_SIZEOF        EQU 188           ; 0xBC: Process size in V34
+; proc_create appends to the Process, in the same tc_MemEntry block (freed by RemTask): the copied C name, then room
+; for a segarray with its getvec header (size, n, V!1, V!2, V!3), used by dos CreateProc.
+PRX_NAME         EQU PR_SIZEOF
+PRX_NAMEMAX      EQU 32
+PRX_SEGA         EQU PRX_NAME+PRX_NAMEMAX
+PRX_SIZE         EQU PRX_SEGA+20
 
 NT_PROCESS       EQU 13            ; ln_Type of a Process (dosextens); the scheduler ignores ln_Type (demo = 0)
 DOS_PORTSIG      EQU 8             ; SIGB_DOS: pr_MsgPort signal bit (reserved by SYS_SIGALLOC -> pre-allocated in main)
@@ -99,6 +105,7 @@ ACTION_FINDOUTPUT  EQU 1006        ; = MODE_NEWFILE
 ACTION_READ        EQU 82          ; 'R'
 ACTION_WRITE       EQU 87          ; 'W'
 ACTION_SEEK        EQU 1008
+ACTION_WAIT_CHAR   EQU 20          ; WaitForChar: (ARG1 timeout in microseconds) -> RES1 -1 = character, 0 = none
 ACTION_END         EQU 1007
 ACTION_LOCATE_OBJECT EQU 8          ; Lock: (ARG1 parent lock, ARG2 BSTR name, ARG3 mode) -> RES1 = BPTR lock
 ACTION_FREE_LOCK   EQU 15          ; UnLock: (ARG1 BPTR lock) -> frees the lock

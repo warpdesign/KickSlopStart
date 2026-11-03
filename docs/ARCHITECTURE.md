@@ -6,6 +6,10 @@
 - Reset header in the first 8 bytes: longword `$0` = initial SSP (`0x11114EF9`, ROM-ID word
   `0x1111` + opcode `0x4EF9`), longword `$4` = initial PC = coldstart address (`$FC00D2` on an
   authentic ROM; `RESET` instruction `$4E70` at `$FC00D0`).
+- ID block (not in a Commodore ROM, README "Identifying the ROM"): `$18` = ASCII `KSS!`, `$1C` = 64-byte field
+  holding a NUL-terminated version string. `boot.s` reserves it zeroed; `mkrom.py --id` writes `KickSlopStart
+  $(KSS_VERSION)` before the checksum (Makefile: `git describe`, release workflow: the tag or short SHA). A stamp
+  file `build*/kss_version` re-runs mkrom when the version changes. The rest of `$18`-`$CF` stays zero.
 - Footer (container format, see amitools): checksum longword at `taille-0x18`, size field at
   `taille-0x14`, 8 words `0x0018..0x001F` at `taille-0x10`. Valid checksum = sum of the longwords
   (carry folded back) equal to `0xFFFFFFFF`. **Not verified by the OS before V37**, but required by the tools.
@@ -21,11 +25,16 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
 `console`/`trackdisk`(20) → `intuition`(10) → `alert.hook`(5) → `mathffp`/`workbench.task`/`dos`(0) →
 `romboot`(-40) → `strap`(-60).
 
+Custom-chip ownership (which module writes which Agnus/Denise/Paula register and bit, interrupt dispatch,
+acknowledge rules) on the official ROM: `docs/analysis/custom-chips-v34.md`; its §7 lists where `src/`
+differs.
+
 ## `src/` structure (clean track)
 
 | Folder | Planned contents |
 |---------|---------------|
 | `src/rom/` | M0 hello-ROM (`start.s`) + `mkrom.py` (padding + footer + checksum) |
+| `src/softkick/` | soft-kick disk: loader bootblock (`bootblock.s`) + ADF builder (`mkadf.py`), see build pipeline step 3 |
 | `src/exec/` | exec.library, split into modules linked by vlink: `exec.i` (constants/ABI), `boot.s` (header/reset, coldstart, ExecBase, init_task, publish, selftest), `lists.s` (lists + Enqueue/Insert/RemHead/RemTail), `memory.s` (multi-header AllocMem/FreeMem, AvailMem, TypeOfMem), `library.s` (Open/Close/Forbid/Permit/Disable/Enable with yield-on-reschedule, jump table; **`OpenLibrary`/`CloseLibrary`/`OldOpenLibrary`**: opening by name = Forbid + `FindName(LibList)` + version gate (`lib_Version >= version`, otherwise 0) + call of the lib's Open/-6 vector; ramlib disk loading if non-resident deferred to M6), `tasks.s` (AddTask, FindTask, signals, Signal waking blocked tasks + requesting a reschedule if higher priority, SetTaskPri), `ports.s` (AddPort/RemPort under Forbid; M7d: PutMsg/GetMsg/ReplyMsg INTERRUPT-SAFE = Disable/raw_enable, atomic vs an IRQ that touches the same MP_MSGLIST), `interrupts.s` (init_ints + INT2/INT3/INT6/TRAP handlers sharing a **common prologue** `movem` (at the **native** IPL since M7e) and a **common epilogue** `intr_exit`; M7f: the 3 autovectors in use are UNIFORM — `int2_dispatch`(PORTS)/`int3_dispatch`(level 3)/`int6_dispatch`(EXTER) go through `intr_dispatch_number` -> server chain; the round-robin decision is `sched_server`, a server of the VERTB chain; M7g: `int3_dispatch` decodes `INTREQR` and dispatches EACH pending level-3 source (COPER/VERTB/BLIT); M7c: **user-mode** tasks on a **shared SSP**, `dispatch` **relocates** the context frame SSP↔user stack and saves the per-task nesting, `dispatch_in` rte's into user mode; voluntary switch via `trap #0`/`#1`; **deferred dispatch flag** `intr_isr_defer` at IRQ exit when a server sets `AttnResched`; M7e: critical section of the switch raised to a **brief IPL7** = re-entrancy gate of the lists, instantaneous vs INTENA's propagation delay; dispatcher by number `SetIntVector`/`AddIntServer`/`intr_chain_walker`, M7b), `resident.s` (ROM scan of the ROMTags → pri-sorted `ResModules`, `FindResident`/`InitResident`/`InitCode`), `libinit.s` (`MakeLibrary`/`MakeFunctions`/`InitStruct` — lib/device creation, AUTOINIT path), `resident.s` also adds `AddResource`/`OpenResource`; **`cia.s`** (`cia.resource`: 1st real resident module — ciaa/ciab + PORTS/EXTER servers `ciaa_server`/`ciab_server` + ICR dispatch), **`timer.s`** (`timer.device`: 2nd real resident, AUTOINIT device + VBLANK unit + MICROHZ unit via CIA-B/INT6), **`trackdisk.s`** (`trackdisk.device` — **B1/M6t**: 2nd device, ROMTag AUTOINIT pri 20 → DeviceList; `Open` validates the unit number (DF0-3 → io_Unit = unit area, io_Device = base, OpenCnt++; unit ≥ 4 → OpenDevice failure io_Error/io_Device=0); `BeginIO` (**B4/M6w** then **multi-track M6z**: handles **`CMD_READ`** — converts the byte offset into (track, sector) via `bloc=offset/512`, `piste=bloc/11`, `secteur=bloc%11`, loops over EACH touched track via td_read_track+td_decode_track, copies up to the end of the track and advances → a request CROSSING a track boundary is served in several reads; guards `IOERR_BADLENGTH` (offset/length multiples of TD_SECTOR) and `TD_DISKBYTES` (bound); other commands → IOERR_NOCMD; **ReplyMsg if non-quick** written but only the QUICK path is proven for now — the non-quick one will be exercised by a real `DoIO` in C); units = placeholders → Unit+MsgPort in B2. **B2/M6u**: `td_read_track0` reads a raw MFM track from DF0 — CIA-B DDRB=$FF + PRB motor/select DF0 (latched via the SEL0 edge), spin-up (DSKRDY poll with timeout), **Paula disk DMA** (ADKCON WORDSYNC, DSKSYNC=$4489, DSKPT, DSKLEN×2), poll `INTREQR` DSKBLK with timeout; registers/bits in `disk.i`. Writes ONLY CIA-B PRB (MICROHZ/M7a timers intact). **B2b/M6x**: `td_read_track(n°)` seeks first — recalibration to track 0 (step OUT via DSKDIREC until DSKTRACK0) then step IN up to the target cylinder + side-select (DSKSIDE according to track&1) → reads any track; `td_decode_track` returns the decoded track no. (seek oracle). **B3/M6v**: `td_decode_track` scans the $4489 syncs, decodes each sector (odd/even combine `((odd&$55555555)<<1)|(even&$55555555)`), checks the header AND data checksums (XOR of the MFM longs & mask), stores the 512 bytes by sector no. → 11 sectors decoded+verified, sector 0 = bootblock "DOS\0"; algorithm locked by a Python round-trip), **`strap.s`** (`strap_boot` — **M6r**: SCAFFOLD of the boot decision; returns 0 = no bootable volume → the caller **routes** the display of the insert-disk screen through this decision; `FindName(trackdisk)` + CMD_READ + validation/execution of the bootblock will come in increments B/C); linker script `kick.ld`, `execmisc.s` (complementary V34 exec LVOs: SetFunction, Cause/SOFTINT, Alert, SuperState...) |
 | `src/graphics/` | graphics track (M4+): `graphics.i` (OCS display registers derived from `CUSTOM`: COP1LC/COPJMP1/DIW/DDF (overscan 352×272)/BPLCON0/1/BPL1-2MOD/BPL1PT/COLOR00-01 + DMACON bits; boot screen dimensions), `gfx.s` (`gfx_display_init` — **M6s**: allocates 5 chip bitplanes, COPIES the **boot screen** into them (kitten image "KickSlopStart" 352×272×5 = 32 colours, overscan) from the ROM, sets up BitMap/ViewPort/View/ColorMap(32), `FindName("graphics.library")`, then `MakeVPort`/`MrgCop`/`LoadView` **through the jump table** → the copper list (5 plane pointers + 32 colours) is GENERATED by the ABI; restores `a6`=SysBase. M4a/M4b/M4c2 history: 1-plane striped screen, replaced here by the image), **`graphics_lib.s`** (`graphics.library` — ROMTag AUTOINIT pri 65 → `MakeLibrary` into `LibList`, **M4c1**; **M4c2** display engine, **M6s**: `MakeVPort` made **GENERIC** — emits one BPLxPT pointer per plane (depth) + `cm_Count` colours COLOR00.. → supports 1 plane/2 colours as well as 5 planes/32 colours; `MrgCop` merges → `v_LOFCprList`, `LoadView` installs COP1LC + `DMACON`), `mk_bootscreen.py` (Pillow pipeline generating the boot screen data: user JPEG → 352×272 → quantize 32 colours → 5 planar bitplanes, **self-checking**; outputs `bootscreen.raw` + OCS palette + reference PNG) + `bootscreen_data.s` (GENERATED: palette + `incbin bootscreen.raw`). VISUAL discriminant (number of unique captured colours); proof by elimination (RED `BOOTSCR_ONE_PLANE`); **`draw.s`** (WB step 6): drawing primitives in a RastPort (Move/Draw/RectFill/SetRast/WritePixel/Text/ScrollRaster...), clipping by the bounds of `rp_Layer`; fills by `dr_rect` (once per ClipRect and per plane, longs/words) and segments by `dr_line` (Bresenham with incremental address), "string" path of Text in all modes, BltTemplate by fixed operation per plane, see probes `tests/drawcheck.s` (pixels) and `tests/drawperf.s` (timing) |
 | `src/intuition/` | intuition track (M5+): `intuition.i` (V34 `IntuitionBase` layout — stable 1st-generation fields: `ib_LibNode`/`ib_ViewLord` (embedded View = the "ViewLord")/ActiveWindow/ActiveScreen/FirstScreen/Flags/Mouse/Seconds/Micros; `INTUITIONBASE_SIZE`=80; LVO `ViewAddress`=-294), **`intuition_lib.s`** (`intuition.library` — resident module ROMTag AUTOINIT pri 10 → `MakeLibrary` into `LibList` (NT_LIBRARY branch), **M5**: Open/Close/Expunge skeleton + `ViewAddress` (vector 49) returning `&ib_ViewLord`). SERIAL discriminant (marker M5I); proof by elimination (RED `M5I_BAD_VIEWADDR`). **`screens.s`** (WB step 6): OpenScreen/CloseScreen/OpenWorkBench/GetScreenData, drawn OpenWindow/CloseWindow (RastPort + pseudo-layer per window); `requester.s`/`pointer.s`: clickable insert-disk requester and pointer accumulator |
@@ -52,10 +61,24 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
    The final hand-off (`RemHead(TASKREADY)`+`dispatch_in`) is generic; in prod the system idles via
    `.d_idle` instead of spinners. `kick-prod` **removes the harness, adds no OS capability**: booting
    a complete game remains a separate milestone (identical dev/prod — see the Lemmings smoke test in the ledger).
-3. **hello-ROM** (`make hello`): single file via `vasmm68k_mot -Fbin` (M0 smoke test).
-4. `src/rom/mkrom.py` pads to 256K, writes the footer + size field + checksum.
-5. `romtool info` validates the container (`is_kick = ok`, `chk_sum = ok`) — hard gate of `make verify`.
-6. `tests/boot_test.sh` boots the image under FS-UAE and asserts the **serial log** (primary channel, captured
+3. **Soft-kick disk** (`make adf`): `make kick-ram` builds the production image with `-DRAMKICK=1`, linked at
+   `$C00000` (`src/exec/kick-ram.ld`, objects in `build/ram/`, image `build/kick13-ram.bin`). `RAMKICK` sets
+   `ROMBASE`/`ROM_BASE` (ROMTag scan range, EXEC_SVC test of `priv_handler`) to `$C00000` and `SLOW_RSV` to 256 KB:
+   `add_slow_memory` probes and declares the slow RAM above the image. At each boot the image sets
+   `ExecBase->ColdCapture` to its `coldstart`. `src/softkick/bootblock.s` (boot code, run by the Kickstart in the
+   machine) checks with `TypeOfMem` that slow RAM covers the image, reads blocks 2..513 into a chip buffer, checks
+   the `$1111` header, the reset PC and the Kickstart sum, then a stub placed after the image copies it to `$C00000`
+   with interrupts and DMA off and jumps to its reset PC. Otherwise it boots the disk normally. When the image
+   already runs (ExecBase->ColdCapture points into `$C00000-$C3FFFF`) the boot code fails, so our strap shows the
+   insert-disk screen and `disk_watch` reboots on the next disk inserted; `dw_reboot` jumps to `ROMBASE+4`, i.e.
+   straight back into the image, which RESET leaves in place.
+   `src/softkick/mkadf.py` writes the ADF: bootblock, image in blocks 2..513, empty OFS volume "KickSlopStart"
+   whose bitmap marks the image blocks as used. The release workflow publishes the ADF with the ROM.
+4. **hello-ROM** (`make hello`): single file via `vasmm68k_mot -Fbin` (M0 smoke test).
+5. `src/rom/mkrom.py` pads to 256K, writes the footer + size field + checksum (`--base` = link address checked
+   against the reset PC).
+6. `romtool info` validates the container (`is_kick = ok`, `chk_sum = ok`) — hard gate of `make verify`.
+7. `tests/boot_test.sh` boots the image under FS-UAE and asserts the **serial log** (primary channel, captured
    via a `socat` PTY bridge on `serial_port`): success marker present + failure marker absent;
    automatic fallback to the screen colour if there is no serial emission (e.g. hello-ROM). The ROM emits
    checkpoints (`chk core`/`chk mem`/`chk m24a|b|c` → `self-test passed`) locating any failure.
@@ -449,14 +472,14 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
 - **exec `OpenLibrary` DONE** (`library.s`: `OpenLibrary`/`CloseLibrary`/`OldOpenLibrary`; serial marker M5O: success version 34 + OpenCnt+1, version gate 99→0, non-existent lib→0, CloseLibrary→OpenCnt-1; RED `OPENLIB_NO_VERCHECK`). The M4c1/M5 proofs (FindName+Open by hand) can now be refactored to go through `OpenLibrary` (follow-up).
 - **dos.library resident skeleton DONE** (`src/dos/`: `DosBase`+`RootNode`+`DosInfo` linked by **BPTR**, structures separately AllocMem'd/long-aligned; `DateStamp`-192 → (0,0,0) clock not set + returns the pointer; serial marker **M6D**: AUTOINIT→LibList + BPTR round-trip `rn_Info<<2==&DosInfo` (compute-then-compare, without dereferencing) + DateStamp; RED `M6D_BAD_BPTR` isolates the BPTR encoding; checksum `0x929C804F`). 1st M6 increment.
 - **Boot screen DONE** (`src/graphics/`: kitten image "KickSlopStart" 352×272×5 = 32 colours in overscan, displayed at handoff through the graphics.library ABI; `MakeVPort` made generic N planes/M colours; serial marker **M6S** (liveness) + VISUAL discriminant (unique colours: GREEN ~18-19k vs RED one-plane ~36); RED `BOOTSCR_ONE_PLANE` isolates multi-bitplane rendering; self-checking `mk_bootscreen.py` pipeline). ⚠️ Displayed **unconditionally** at handoff for now: the real "no bootable volume" trigger remains for the strap increment.
-- **Strap (romboot) — routing DONE (M6r)** then **reading+validation+execution of the bootblock DONE (C/M6y)** (`src/exec/strap.s`). M6r: `strap_boot` routes the insert-disk display through its decision. **C**: `strap_boot` now REALLY reads sectors 0+1 of DF0: (`CMD_READ` offset 0 len 1024, via `BeginIO`-30, M6w pattern), validates the "DOS" magic + **additive checksum** (end-around-carry sum of the 256 longs == `$FFFFFFFF` — ADDITIVE, not XOR like the MFM checksums), then **jumps to the boot code at +12** (A6=SysBase, A1=IORequest; dos handoff A0 IGNORED, no dos in C). Bootable → returns "booted" (**M6Y**, no insert-disk); invalid checksum (formatted ADF without install = checksum 0) or no disk → returns 0 → insert-disk (**M6R**) = the REAL 1.3 trigger. RED `STRAP_FAKE_BOOTDEV` (routes without reading), `STRAP_NO_EXEC` (validates without jumping → isolates execution), `STRAP_BAD_CSUM` (rejects a good block → isolates validation). Proof: the **CBOOT** marker is emitted by the bootblock ITSELF → proves the jump. Regenerable custom bootable test ADF (`tests/mk_boot_adf.sh` + `tests/bootblock_c.s` + `tests/patch_bootblock.py`, round-trip).
+- **Strap (romboot) — routing DONE (M6r)** then **reading+validation+execution of the bootblock DONE (C/M6y)** (`src/exec/strap.s`). M6r: `strap_boot` routes the insert-disk display through its decision. **C**: `strap_boot` now REALLY reads sectors 0+1 of DF0: (`CMD_READ` offset 0 len 1024, via `BeginIO`-30, M6w pattern), validates the "DOS" magic + **additive checksum** (end-around-carry sum of the 256 longs == `$FFFFFFFF` — ADDITIVE, not XOR like the MFM checksums), then **jumps to the boot code at +12** (A6=SysBase, A1=IORequest; dos handoff A0 ignored in C, used since 2026-11-02: see "strap" below). Bootable → returns "booted" (**M6Y**, no insert-disk); invalid checksum (formatted ADF without install = checksum 0) or no disk → returns 0 → insert-disk (**M6R**) = the REAL 1.3 trigger. RED `STRAP_FAKE_BOOTDEV` (routes without reading), `STRAP_NO_EXEC` (validates without jumping → isolates execution), `STRAP_BAD_CSUM` (rejects a good block → isolates validation). Proof: the **CBOOT** marker is emitted by the bootblock ITSELF → proves the jump. Regenerable custom bootable test ADF (`tests/mk_boot_adf.sh` + `tests/bootblock_c.s` + `tests/patch_bootblock.py`, round-trip).
 - **trackdisk.device — skeleton (B1) DONE** (`src/exec/trackdisk.s`: 2nd device, AUTOINIT pri 20 → DeviceList, `Open` validates units DF0-3; serial marker **M6T**; RED `TD_NO_UNITCHECK` isolates unit validation). Foundation of disk reading.
 - **trackdisk raw track read (B2) DONE** (`td_read_track0`: the ROM really READS an MFM track from DF0 via Paula disk DMA — 22 `$4489` sync words found on a test ADF; serial marker **M6U** + sync count; RED `TD_NO_DMA` isolates the arming of the DMA; harness `tests/boot_test.sh` extended with an optional floppy in DF0). 1st time the ROM accesses the disk hardware.
 - **trackdisk MFM decoding (B3) DONE** (`td_decode_track`: 11 sectors × 512 bytes decoded+verified, sector 0 = bootblock "DOS\0"; serial marker **M6V**; RED `MFM_BAD_DECODE`).
 - **trackdisk CMD_READ (B4) DONE** (`BeginIO` handles `CMD_READ`; serial marker **M6W**; RED `TD_READ_NOCMD`).
 - **MULTI-TRACK trackdisk CMD_READ (M6z, D prerequisite) DONE**: `BeginIO` converts the byte offset into (track, sector) and loops over the touched tracks (crosses track boundaries); guards `IOERR_BADLENGTH`/`TD_DISKBYTES`. Serial proof **M6Z** = root block @block 880 (track 80, +0==T_SHORT, +508==ST_ROOT) + spanning read of blocks 10+11 (markers "SPAN0010"/"SPAN0011" straddling the track 0/1 boundary). RED `TD_NOSEEK` (always reads track 0, without crash) → M6Z absent (isolates the offset→track mapping).
 - **trackdisk seek + side-select (B2b) DONE** (`td_read_track(n°)`: seek to an arbitrary track + side; proven by reading track 2 → decoded sectors carry track==2; serial marker **M6X** + TRACK= diagnostic; RED `SEEK_NOSTEP`). **trackdisk.device is now complete**: it reads any logical sector of any track of DF0.
-- **trackdisk — CYLINDER-TRACKING**: `td_read_track` tracks the current cylinder (`TD_CURCYL`/`TD_CYLVALID`) and steps the **delta** to the target (recalibration to 0 only if the position is unknown) — CLEANLY fixes the "read after a seek read the wrong track" bug (the delta brings the head back to the right cylinder) AND removes the 85-step recalibration on every read (fast reads, required under the scheduler). RED `TD_NO_CYLTRACK` (systematic recalibration → D3B absent at WAIT=90). "Absent/empty drive" detection via the **DSKRDY timeout** (return before the seek). Multi-track `CMD_READ` offset→track wiring delivered (M6z). Debt: no invalidation on disk change (real eject/swap → periodic recalibration, M7).
+- **trackdisk — CYLINDER-TRACKING**: `td_read_track` tracks the current cylinder (`TD_CURCYL`/`TD_CYLVALID`, per unit since DF1: `TDU_CYL`/`TDU_CYLOK`) and steps the **delta** to the target (recalibration to 0 only if the position is unknown) — CLEANLY fixes the "read after a seek read the wrong track" bug (the delta brings the head back to the right cylinder) AND removes the 85-step recalibration on every read (fast reads, required under the scheduler). RED `TD_NO_CYLTRACK` (systematic recalibration → D3B absent at WAIT=90). "Absent/empty drive" detection via the **DSKRDY timeout** (return before the seek). Multi-track `CMD_READ` offset→track wiring delivered (M6z). Debt: no invalidation on disk change (real eject/swap → periodic recalibration, M7).
 - **trackdisk — SEEK/INTERRUPT RACE FIX (CIA-B)**: the seek's step pulses write `CIAB_PRB`; the MICROHZ source (CIA-B timer A, INT6) shares the SAME chip. An INT6 IRQ falling between the PRB writes of a step corrupts the head positioning → the next read **falls over** (hang). Invisible as long as the boot only reads low blocks (small seeks): exposed by a **large seek to a high block** on a real full disk (e.g. opening `flt-intro` on a Lemmings floppy). FIX = **`Disable`/`Enable` critical section around the SEEK only** (`td_read_track`, `.rd_seek`→`.rd_dma`); the downstream DMA polls `INTREQR` → no IRQ required → minimal IRQ latency (vs masking the whole read). **Cause proven by bisection, not assumed**: a PURE inter-step delay does NOT fix it (so not a settle defect), masking IRQs DOES (3/3). Non-regression: complete GREEN (D1/D3B/OFS STREAM/M7A/M7L/FORBID ATOMIC/E3/F1BOOTOK, 0 FAILED) unchanged.
 - **"It boots!" (C/M6y) DONE**: see the Strap line above — the strap reads+validates+executes the bootblock of a bootable ADF, proven by the **CBOOT** marker emitted by the bootblock. First EXTERNAL (disk) code executed by the ROM.
 - **LEMMINGS FAIRLIGHT CRACKTRO DISPLAYED (real game milestone)**: the ROM boots the *Holiday Lemmings 1993 [h FLT]* floppy, its `s/startup-sequence` launches `flt-intro` (FLT cracktro), which **IS DISPLAYED ON SCREEN** (FAIRLIGHT logo + BBS list, proven by capture). It required three pieces: (1) the trackdisk seek race fix above (flt-intro, block 1597, finally loaded); (2) **graphics.library** — jump table extended to vectors 38-77 + `WaitBlit`(-228)/`OwnBlitter`(-456)/`DisownBlitter`(-462) (stubs: the intro does not use the blitter) + `LoadView`(-222) handles the **NULL view** (turns off bitplane+copper DMA instead of dereferencing address 0); (3) **exec `Supervisor`(-30)** (`library.s` + `trap3_handler` in `interrupts.s`): `trap #3` → supervisor → `jmp (a5)`; the routine (the intro) ends with `RTE`, which unstacks the trap frame → return to the caller. The intro drives copper/bitplanes/DMACON/BEAMCON0 **100% directly** in supervisor mode (no rendering through graphics.library; ActiView/copinit/LOFlist only SAVED-for-restoring, never dereferenced — GfxBase layout intact). Clean-room analysis of the bootblock + the unpacked cracktro (r2, GAME disk = outside the Kickstart firewall). Complete GREEN non-regression unchanged. **Honest scope**: it is the CRACKTRO that runs; the game `HolidayLemmings` (145 KB > 16 KB shell buffer + LoadSeg cap) remains a separate "large loader" milestone.
@@ -547,10 +570,10 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
   gives a probe step with the motor stopped when /CHNG is low). Ejection: volume detached (node removed from the DosList if it
   has neither a lock nor an open file — usage count in dol_unused, +$24 —, otherwise dl_Task := 0), IECLASS_DISKREMOVED.
   Insertion: block 0 ("DOS\0", otherwise the type as is / "BAD\0"), root block checked ("NDOS" otherwise), node with the
-  same name and same creation date reactivated or created at the head of the list (DL_VOLUME), bitmap forgotten, time set,
+  same name and same creation date reactivated or created at the head of the list (DL_VOLUME, per handler since DF1: HC_VOLUME), bitmap forgotten, time set,
   IECLASS_DISKINSERTED (also for a non-DOS disk). A lock or a file of another volume is refused (218), the
   root without a disk too (226 / 225). ACTION_INHIBIT detaches without an event and remounts when lifted. Context of the
-  handler in low RAM (HND_CTX, $7C0); the volume node is no longer created by dos at boot. intuition broadcasts
+  handler in low RAM (HND_CTX, $7C0; since DF1: one context per handler, in tc_UserData); the volume node is no longer created by dos at boot. intuition broadcasts
   DISKINSERTED / DISKREMOVED to all windows that request them (it_diskbc). Workbench: one icon per mounted
   volume (table WBS_VOLS, 8 at most), "<volume>:Disk.info" otherwise a default icon drawn by hand, placement in
   96 px columns from the right; surveyed at startup, at the 5 s tick and on these IDCMPs; RAM DISK appears there.
@@ -564,6 +587,163 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
   Known differences: no "DF0:NDOS" icon, a volume whose window is open still loses its icon on
   ejection if it has no lock; a Lock by the name of a known but absent volume gives "Please insert volume"
   (insert/replace split not settled by the spec).
+  (7p) **gameport units 0/1 and exec raw serial** (2026-11-02). gameport.device implements both units and the
+  commands of spec `gameport-v34.md`: GPD_READEVENT queue, 8-slot event ring (7 usable), trigger
+  (keys/timeout/deltas), ASK/SETCTYPE (mouse, relative and absolute joystick), ASK/SETTRIGGER, CMD_CLEAR/STOP/
+  START/FLUSH/RESET, AbortIO; `gp_unit_frame` samples each unit in the VERTB server (JOYxDAT, CIA-A PRA bits 6/7,
+  POTGOR) and the server writes POTGO with the pot bits of both units. Unit 0 is set as input.device leaves it on
+  1.3 (mouse, trigger {3,0,1,1}); the mouse still reaches input.device through IND_WRITEEVENT. Our AllocPotBits
+  returns the DATxx bits only, so gameport adds their OUTxx partners to the WritePotgo mask. Proven under Amiberry
+  with a probe program (startup-sequence, unit 1): ABSJOYSTICK gives {+1,0} / {0,0} / {0,-1}, fire `$68`/`$E8`
+  with qualifier `$4000`; RELJOYSTICK one event per frame with X = -1 and qualifier `$8000`. exec raw serial
+  follows custom-chips §4.3 (SERPER 372 from RawIOInit at coldstart, 7-bit RawMayGetChar, Ctrl-S/DEL in
+  RawPutChar; Debug still empty). Found on the way: a bootblock that blocks in DoIO hangs on our ROM, because the
+  strap runs before the scheduler starts (not fixed).
+  (7o) **SCREENBEHIND** (2026-11-02). `OpenScreen` links a screen whose type has `$0080` at the tail of the screen
+  list and leaves ActiveScreen alone (spec `intuition-screens-v34.md` §2.1 step 21, checked on the real ROM with
+  SimCity in `intuition-screenbehind-v34.md`); it was always put at the front. SimCity opens its title screen that
+  way, draws it plane by plane and sets its palette, then calls ScreenToFront: the user saw the picture being drawn
+  in three wrong colour stages. Now the Workbench stays up and the finished title appears in one frame (~26 s after
+  the double-click, as on 1.3).
+  (7n) **Chip RAM sized up to 2 MB** (2026-11-02). `init_memory` sizes the chip RAM as 1.3 does (spec
+  `coldstart-hardware-v34.md` §2: a long at each 4 KB boundary, sentinel at `$0` to catch the mirror), from 512 KB
+  up to 2 MB, and sets `MaxLocMem` and the chip MemHeader from it; it used to stop at a fixed 512 KB. Found with
+  Caesar on vAmigaWeb (2 MB chip + 2 MB fast): `csr.exe` failed with error 103 (no free store). Proven under
+  Amiberry, chip 2048 KB ECS without fast: `MaxLocMem` = 2 MB and Caesar loads; 512 KB configs unchanged.
+  (7m) **ColdCapture, ExecBase ChkSum, soft-kick disk** (2026-11-02). `coldstart` now honours the ColdCapture of
+  an ExecBase that survived the reset (spec `coldstart-hardware-v34.md` §5.1: `*(4)` even, ChkBase, word sum of
+  `+$22..+$52` = `$FFFF`; the vector is cleared, then called with SR `$2700`, A6 = ExecBase, return address in A5),
+  right after the overlay is lifted. `boot.s` computes `ChkSum` once the fields `+$22..+$4E` are final (after
+  `add_slow_memory`). The RAMKICK image (build pipeline, step 3) relies on it to survive a reset, on the Kickstart
+  in ROM and on ours. Proven under Amiberry with our production ROM as host: the disk loads the image ("(RAM)" serial
+  marker, 512 KB of slow RAM seen, shell), a reset jumps from the ROM's ColdCapture code to the image's `coldstart`
+  (fetch watch) and the image boots again; with no slow RAM the disk boots normally. Then: the image shows the kitten
+  insert-disk screen; ejecting the disk and inserting Lemmings reboots into the image and the FAIRLIGHT intro runs.
+  (7l) **Pointer colour** (2026-11-02). Our default pointer (`ptr_image`, drawn for the project) was compared with
+  the original by an analysis agent (`intuition-prefs-v34.md` §4.2): a different arrow, 80 pixels out of 256 differ.
+  Its fill (colour 17, `pf_defaults` in `prefs.s`) is now dark purple ($517) instead of red, a deliberate difference
+  listed in the README. A Workbench disk still loads the pointer and colours of its `devs:system-configuration`.
+  (7k) **The Workbench 1.2 disk boots to its desktop** (2026-11-01, after issue #10). Its startup-sequence stopped at
+  the 1.2 commands, which are BCPL and stricter than the 1.3 ones.
+  - BCPL `rdargs`: an empty template is one positional key, like an empty name between commas (spec
+    `bcpl-runtime-v34.md` §5.4). The 1.2 `Echo` reads its text with `rdargs("")` and reported "Invalid argument".
+  - Initial shell: `s/startup-sequence` is opened as cli_CurrentInput and run by `sh_runscript`, the loop already
+    used for Execute scripts, instead of a private 2 KB buffer. The 1.2 `If` refuses to run when CurrentInput equals
+    StandardInput ("IF only valid within command files"), and a false `If` or a `Skip` reads the lines to jump over
+    from that stream. Scripts go through `sh_dispatch_line`, so the builtins stay available to them.
+  - Command lookup (`sh_exec_cmd`): current directory, then each entry of cli_CommandDir (Path ADD), then C:. The
+    path entry stays the current directory until LoadSeg, then the CLI's one is restored. `SetMap`, in SYS:System,
+    was not found before.
+  - The builtin `echo` gives way to the disk's `C:Echo` when there is one (quotes and `*N` handled by the real
+    command); it remains for disks without C: (harness ADFs). Deviation: `rcli_rdline` also ends a line at CR, as
+    the harness scripts are CR-terminated.
+  - Proven under FS-UAE: the Workbench 1.2 desktop comes up by itself, the issue #10 scenario (Demos drawer, Lines
+    started from its icon and resized) runs without Guru; Workbench 1.3.3 still boots to its desktop.
+  (7j) **Window resizing: simple layers, real SuperBitMaps** (GitHub issue #10, 2026-11-01; specs
+  `layers-v34.md` §4-§6 and §10.1, `intuition-gzz-v34.md` §2.5, completed by `tests/resize_probe.s` on the real ROM).
+  Reported with the Workbench 1.2 disk: resizing the Lines demo gave a Guru #5, resizing Clock left old dials.
+  - graphics `dr_rect`: the high word of d6 (bytes per plane of a multicolour pattern) is only used with a pattern.
+    Draw, SetRast and ClearEOL pass no pattern but left anything there, so a null pattern pointer was advanced
+    between planes and the next plane was filled from a bogus odd address (address error in Lines at launch).
+    Regression of the multicolour RectFill (7g).
+  - layers, simple layers: MoveLayer and SizeLayer damage the whole layer (SizeLayer empties the DamageList
+    first) and clear its visible parts. The 1.3 ROM keeps nothing of a resized simple layer and only thin strips
+    of a moved one; we clear everything. Clock, which does not erase its background, now redraws on a blank window.
+  - layers, LAYERSUPER with a SuperBitMap: 4 SuperClipRects (one block, `SuperSaveClipRects`) cover the SuperBitMap
+    outside the window, rebuilt at creation and after Move/Size/ScrollLayer. Deviation: their bounds are absolute,
+    like the other ClipRects, so graphics can filter every ClipRect the same way; `cr_lobs` = the layer marks them.
+    SizeLayer, MoveLayer and ScrollLayer save the layer into the SuperBitMap first (SyncSBitMap) and show it again
+    afterwards (CopySBitMap); such a layer is never damaged. ScrollLayer changes Scroll_X/Y (also without a
+    SuperBitMap). SyncSBitMap/CopySBitMap are graphics LVO -444/-450 (code in `layers.s`).
+  - graphics: the drawing offset is bounds - Scroll. The write loops (span, rect, line, text cell, BltTemplate,
+    BltBitMapRastPort) go on with the SuperClipRects after the layer's list (`dr_next`); `dr_crset` points such a
+    piece at the SuperBitMap. ClipBlit's source side, ScrollRaster and ReadPixel stay on the window. `dr_line`
+    stops walking a segment once it leaves the current ClipRect again (x and y are monotonic, so the points
+    inside form one run); `tests/drawcheck.s` gives the same fingerprints as before.
+  - The boot self-test of layers expected a resized simple layer to keep its contents; it now expects 0.
+  - intuition: the interior layer of a GIMMEZEROZERO | SUPER_BITMAP window gets NewWindow.BitMap as SuperBitMap
+    (it had none, so Lines read `Layer->SuperBitMap->Rows` from low memory and divided by 0).
+  - Proven under FS-UAE with the Workbench 1.2 disk, programs started from the shell: Lines shrunk to its minimum
+    and enlarged without Guru, contents back from the SuperBitMap; Clock enlarged three times then shrunk, no old
+    dial left after enlarging.
+  - Still open: the real ROM sends no NEWSIZE for a SizeWindow() call (probe Q4; untested for a drag of the
+    size gadget, which is what Lines and Clock rely on); we send it for both. After a shrink, Clock may leave a
+    sliver drawn with its old size before it handles NEWSIZE. Lines draws about 37 lines/s with our CPU line
+    drawing into its 1008 x 512 SuperBitMap, so its small window changes much less often than on the 1.3 ROM
+    (frozen for ~16 s there too, then bursts every few seconds). A non-GZZ SUPER_BITMAP window's frame is not put
+    into the SuperBitMap as the 1.3 ROM does (probe Q6). The Workbench 1.2 disk did not reach its desktop: see (7k).
+  (7i) **Memory usage and race fixes** (2026-10-30).
+  - Memory: an idle English Workbench leaves ~60 KB less free than on 1.3. Breakdown by caller in
+    `docs/MEMORY-USAGE.md`, measured with `MEMTRACK`. Each entry now records the `AllocMem` caller, so an entry is
+    12 bytes. The 45 KB trackdisk track cache and the 4 KB intuition input task are deliberate. The console
+    self-test #3a in `boot.s` left a 10 KB chip bitmap allocated; it now frees `CONB_BITMAP` and resets the
+    cursor.
+  - Flood (`area.s`) holds the layer lock for the whole fill. Before, it read the layer bounds without the lock,
+    the same family as the `dr_ctx` race. The exec semaphore is re-entrant, so the drawing calls Flood makes
+    still work.
+  - `conhandler.s`: a READ answered with EOF (no timer state) fell into the new DISK_INFO code. That code then
+    wrote an InfoData at ARG1 and returned DOSTRUE. It now replies directly.
+  - Race audit of `src/`. A separate read-only agent ranked 12 suspects; these fixes followed:
+    - trackdisk: BeginIO runs in the caller's task and the drive state is global. Before, the DF0: handler's
+      1 s TD_CHANGESTATE could deselect the drive in the middle of another task's DMA, and a second CMD_READ
+      took over TD_DMATASK so the first waiter was never woken. The device semaphore of the DF1 work (PR #9, held
+      for the whole BeginIO) closes this; the low-RAM semaphore first written for it was dropped at the merge.
+    - input.device and gameport.device reply to requests without IOF_QUICK. Before, SendIO + WaitIO hung. Every
+      BeginIO call on input inside the ROM now sets IOF_QUICK: feeder, gameport VBlank, console, Preferences and
+      the boot self-tests.
+    - Intuition event ring (`it_push`): the head is read, the slot written and the head published with
+      interrupts off. Its producers are the feeder, the DF0: handler and the VBlank mouse path.
+    - DosList: `dos_resolve` and `dos_fullreq` walk it under Forbid. The DF0: handler frees an ejected volume's
+      node, and FreeMem overwrites DN_NEXT.
+    - console input handler: the active unit's KeyMap is copied with interrupts off before conversion. A CON:
+      handler can close the unit in between.
+    - IntuiMessage pool (`wn_post`, `wn_refreshmsg`): finding a free slot and claiming it now happen under
+      Forbid. Both the input task and the application post to the same pool.
+    - CloseWindow first waits until no drag or menu is in progress on the window. Then, under Forbid, it takes
+      the window out of its layers and the window list and clears the active-window and pressed-gadget
+      references. The input task checks with `it_alive` after each call that can block (it_setactive's veil,
+      wn_scrtitle, CreateUpfrontLayer for the menu bar). `mn_end` clears IB_MENUWIN only after its MENUPICK.
+    - Second round (same day): the remaining suspects.
+      - ClipBlit takes both layer locks first (`cb_lock2`): front to back when they share a Layer_Info, as
+        LockLayers does, otherwise by address. Before, it held the source lock while BltBitMapRastPort took the
+        destination one, so two copies in opposite directions could deadlock.
+      - ScrollRaster takes the blitter only if it is free (AttemptSemaphore on gb_BlitSem), otherwise it copies
+        with the CPU. A program holding the blitter no longer stalls a scroll that holds a layer lock.
+      - `dos_waitreply` (process.s) waits for our own message on the process port. Other messages (replied
+        IORequests of a BCPL handler, packets) are put back in order, with their type. It is used by
+        dos_sendpkt, the BCPL global sendpkt and the startup of BCPL handlers (which used to drop them).
+      - Boot CLI console handler: while a READ waits for its line, WRITE packets (output of `run` jobs) are
+        served at once (`con_side`, `con_dowrite`); other packets are put aside and requeued when the READ ends.
+    - Still open: GELs release the layer lock between saving and restoring the background (cosmetic).
+
+  - Ed 1.14 (GitHub issue #6: window opened, then hung). Four causes:
+    - console.device: `CSI q` / `CSI 0 SPACE q` (Window Status Request) is answered with the Window Bounds Report
+      `CSI 1;1;<lines>;<columns> SPACE r` in the read stream (console.doc). Ed waits for it twice (lines, then
+      columns), so it hung. The read ring now has two producers, so `con_push` adds bytes with interrupts off.
+      `cu_report` finds the console base through the new private `CU_BASE` field.
+    - BCPL runtime: writef, writes, writen, writet and newline send their characters through global 56 (wrch)
+      when a program has replaced it (`wf_flush`, `WF_WRCH`), as BCPL output does. Ed points wrch at its own screen
+      buffer around its `writef("*E[%N;%NH")` cursor positioning. Before, those sequences went to the current
+      output stream instead, and every line was drawn on row 1. `rt_fault`, called from assembly, keeps direct
+      output (`WFRAW`).
+    - console.device: `CSI n @` and `CSI n P` shift the rest of the line right or left, with ScrollRaster.
+    - graphics: ScrollRaster now handles dx (`sr_horiz`, before the vertical pass). The kept part is copied with
+      ClipBlit within the RastPort, by slices of |dx| columns from the right when shifting right, because
+      BltBitMapRastPort copies forward even when source and destination overlap. The freed columns are filled
+      with pen B. Deviation: a source hidden without backup is not reported as damage by this pass.
+    - conwin: ACTION_WAIT_CHAR waits up to its delay (Arg1, microseconds). It answers TRUE as soon as a character
+      is deliverable, FALSE when the delay (timer.device VBLANK, opened on first use, replied on the console read
+      port) runs out, and at once for a delay of 0. Ed asks it after `$9B` to tell a lone CSI from a sequence.
+    - The feeder's "FEEDER OK" self-test read the console once and took a byte of the first key typed after boot,
+      such as the 'B' of cursor-down. It is now dev-ROM only.
+
+  - Workbench icon selection (GitHub issue #7): a selected icon was always inverted (COMPLEMENT). `wb_invert` now
+    follows the highlighting mode of `do_Gadget.Flags` (RKM, Workbench icons). With GADGHIMAGE and a SelectRender,
+    it draws the alternate image (open drawer, open trashcan) over the cleared rectangle, and the normal image again
+    on deselection. Other modes keep the inversion. The callers update WBS_SELW/WBS_SELI first, so `wb_invert`
+    draws the current state. Proven under FS-UAE with the Workbench 1.3.3 [m] disk: the selected "Empty" drawer
+    shows its open drawer, and a click elsewhere restores it.
+
   (7h) **Real keymaps and SetMap: the German Workbench 1.3.3 boots** (2026-10-30; specs `console-keymap-v34.md`,
   `setmap-13.md`). Reported by a user: the German WB 1.3.3 disk hung in `SYS:System/SetMap d`.
   - keymap.resource now has the V34 layout (§1.1): Node, kr_List with one built-in KeyMapNode ("usa", or "f" in the
@@ -982,6 +1162,13 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
   - **ExecBase, jump table and supervisor stack in low chip**: table $1000-$1276, ExecBase $1276, region of the
     multi-header test $1500-$2500 (margin below the stack afterwards), supervisor stack $2500-$3500, heap $3500-$80000. The top of
     chip stays free as on the real 1.3 (intros: routine at $7F000, stack at $7FFFE, planes at $70000+).
+    **With slow RAM** (coldstart-hardware-v34 §4.1), the jump table and ExecBase go to the bottom of it instead:
+    ExecBase $C00276 (ROM) or $C40276 (soft-kick image, which fills $C00000-$C3FFFF), and the "Fast Memory"
+    MemHeader starts right after ExecBase's positive part. `slow_probe` (`memory.s`) runs before ExecBase is built
+    and gives `MaxExtMem` (+$4E, end of the slow RAM, 0 without), which `add_slow_memory` then uses. Zool loads over
+    low chip, then reads MaxLocMem/MaxExtMem to choose where to copy its code ($C10000 with 512 KB slow); with
+    ExecBase in chip or MaxExtMem at 0 it overwrote its own VBlank routine and never read fire. The exec code jumps
+    through the vectors of `*(4)` (Switch, Schedule, Dispatch), never through a fixed address.
   - **No TRAP vector used by exec**: Wait/yield/RemTask(self)/Supervisor enter supervisor mode through a
     privilege violation at a known site in the ROM (EXEC_SVC macro: `ori.w #0,sr`, magic word, address of the
     service; handler at vector $20). Programs often install their code at the TRAP #0 vector to switch
@@ -1206,7 +1393,7 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
   covered track read first), TD_FORMAT, CMD_UPDATE/CLEAR, TD_MOTOR/PROTSTATUS/CHANGENUM/CHANGESTATE/
   GETNUMTRACKS; AmigaDOS MFM encoding (gap 700 bytes + 11 sectors of 1088 bytes, header/data odd then even, XOR
   sums, clock bits); write DMA with precompensation from cylinder 40 on; refusal if /WPRO. (2) **OFS
-  writing** (`src/dos/ofswrite.s`): single context (`DOS_OWCTX`), bitmap kept in memory (refusal if bm_flag invalid),
+  writing** (`src/dos/ofswrite.s`): single context (`DOS_OWCTX`; since DF1: one per handler, `HC_OWCTX`), bitmap kept in memory (refusal if bm_flag invalid),
   allocation starting from the root, file/directory creation (hash chain, replacement of an existing
   file), deletion (empty directory required), renaming/moving (return to the origin if the destination fails),
   protection, comment, disk information; write stream per handle (data blocks type 8, tables filled
@@ -1219,7 +1406,28 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
   (DateStamp always returns 0), header dates not set.
 - **STEP 9 (CONTINUED) — CLI, CONSOLES, ICONS**: (1) **ROM CLI** (`src/dos/shell.s`, `rcli_*`): segment in BCPL format (global 1 = `start(pkt)`) set as `rn_ConsoleSegment` and as entry 4 of the initial CLI's segarray; contract §13.6/§13.7 of the analysis: cleared CLI with its 4 buffers (including cli_CommandFile) stored in pr_CLI, BCPL call of the packet's init with **A0 = 0**, `r > 0` called with pr_Result2, cli_Interactive computed (recomputed at the end of a script), remembered output reselected at each round, prompt `%N`, character-by-character reading of cli_CurrentInput (BCPL buffer then Read), end of a background CLI according to r (Run: closing of the streams; Execute: bits 0/1 then returnpkt), freeing of cli_CommandDir, of the current directory and of the slot. Run, Execute() and NewCLI work without a "CLI" resident. (2) **Initial shell**: redirections `<nom` / `>nom` (arguments injected into the redirected input, "Can't open"), Execute scripts (`sh_runscript`: cli_CurrentInput followed to its end, temporary file deleted), pr_ConsoleTask = initial console (`*` output of the background CLIs), Forbid around commands reserved for the dev ROM. (3) **DOS nodes** CON, RAW (ROM handler `src/dos/conwin.s`, one process and one window per Open, line editing in CON, raw in RAW, asynchronous console reading, READ/WRITE/END/WAIT_CHAR/SCREEN_MODE/DISK_INFO), SER, PAR, PRT (the disk's `L:PORT-HANDLER`), shared GV of the initial CLI. (4) **console.device**: list of open units, keys served to the unit of the active window (otherwise head of the queue); the initial console only takes the keyboard ring if its window is active. (5) **intuition**: ReportMouse, MOUSEMOVE (a pending message is updated, not duplicated), SELECTUP sent to the active window. (6) **Workbench**: draggable icons (XOR ghost frame, position updated in memory, window redrawn). (7) **layers**: a visible ClipRect that stayed in place and is partly uncovered is copied directly from the saves to the screen (closing a drawer ≈ 0.5-1 s in production instead of 1.5-2 s). **Honest scope**: no floppy writing (Rename, Discard, Snapshot impossible), no `>>`, VSprites not displayed, Info not done.
 - **WORKBENCH 1.3.3 — STEP 6: WORKBENCH SCREEN AND VISIBLE WINDOWS**: (1) **graphics.library** — CPU drawing primitives in a RastPort (`src/graphics/draw.s`: SetAPen/SetBPen/SetDrMd/Move/Draw (Bresenham)/WritePixel/RectFill/SetRast/Text/TextLength/SetFont/InitRastPort/InitBitMap/vertical ScrollRaster), without layers.library: if `rp_Layer` is set, its bounds give the offset AND the clipping; single 8x8 font (font8x8, hand-authored); fast paths (byte-aligned JAM2 Text: direct writing; RectFill/ScrollRaster: full bytes in a tight loop, only the edges masked); complete V34 vector table (106); generic `MakeVPort` (HIRES 640 window, low resolution 320 or overscan 352x272, height = DHeight, modulo = BytesPerRow − bytes read), reuse of the copper lists (vp_DspIns, v_LOFCprList), `FreeVPortCopLists` (−540). (2) **intuition.library** (`src/intuition/screens.s`) — `OpenScreen`/`CloseScreen` (V34 Screen struct of 346 bytes + private RasInfo/ColorMap/palette extension, chip planes, title bar and depth gadgets drawn, 1.3 preferences palette), `OpenWorkBench` (640x256, 2 planes, HIRES), `GetScreenData` (−426), front screen displayed through `ib_ViewLord`; real `OpenWindow`/`CloseWindow` (window brought back into the screen, borders according to the flags, own RastPort + pseudo-layer at the window bounds, frame/title bar/gadgets drawn, window active; CloseWindow clears its area); table extended to the V34 set (−468); GfxBase kept at init (`IB_GFXBASE`). (3) **console.device** — a unit opened on a window receives a **ConUnit** (devices/conunit.h: cu_Window, cursor, bounds) and renders its text in the window's RastPort: printable runs through Text, automatic line wrap, scrolling through ScrollRaster, BS/TAB/LF/VT/FF/CR, IND/NEL/RI, ESC c, CSI A-F/H/f/J/K/L/M/m/SPACE p (CSI P = clear to end of line, without shifting), orange cursor by complement; `io_Length = -1` (NUL-terminated string). (4) **dos** — `Open("*")` targets `pr_ConsoleTask`; non-zero dp_Res1 = success; **packets aligned on a long** (`dos_sendpkt` and starthandler's startup packet: a BCPL handler receives the packet as a BPTR — on a word-aligned C stack, the packet was truncated by 2 bytes and the reply went off into the weeds); `fl_Volume` of DF0: locks = volume node (`DL_VOLUME`, otherwise CD rebuilt the volume name from address 0). (5) **BCPL** — globals 105 consoletask / 106 filesystemtask; qpkt sets `message.ln_Name := packet`. (6) **workbench.task** opens the Workbench screen (`OpenWorkBench`). Proofs (FS-UAE, copies of the WB 1.3.3 ADF, production ROM): `copy … to newcon:0/0/640/100/Test` displays the "Test" window with StartupII scrolling; `NewShell NEWCON:0/11/640/150/AmigaShell FROM s:Demo` opens the AmigaShell window on the Workbench screen, runs `echo` and `dir c:` (two columns, scrolling), prompt "2.Workbench1.3:c>"; a command typed on the **real emulated keyboard** (xdotool) is displayed in the window and runs. **Honest scope**: no layers.library (no overlapping nor refreshing of windows, no moving/resizing, no IDCMP), no visible mouse pointer, a single font, no Workbench desktop (icons); the fallback serial shell (E2) also reads the keyboard after the end of the initial CLI.
-- **TRACKDISK — FLOPPY READING ×5** (`src/exec/trackdisk.s`, `TD_*` constants from `exec.i`): (1) **motor kept on**: a read leaves the DF0 motor on (`TD_MOTORON`); the next one skips the spin-up; a VBlank server (`td_motor_server`, `TD_VBLINT`) turns it off after 2 s of inactivity (`TD_MOTORIDLE`, counter `TD_MOTORCNT`, never during an access: `TD_BUSY`); `td_check_change` preserves the motor state. (2) **seek at the drive's timings**: 3 ms between two steps (`TD_STEPWAIT`), 18 ms of settling after the last one (`TD_SETTLE`), instead of very wide delays. (3) **LRU cache of 8 decoded tracks** (`TD_NCACHE` × 5632 bytes in `MEMF_PUBLIC`, slot per track `TD_CTRK`, age `TD_CAGE`/`TD_CTICK`; fallback to 1 slot if memory is short; flushed on `/CHNG`): replaces the single-track cache — the OFS FAT (root, bitmap, headers, chains) kept coming back to the same tracks. Measurement, complete WB 1.3.3 boot (FS-UAE, real time): SetPatch 78 s → 12 s, end of startup-sequence > 400 s → 87 s; physical reads 222 → 103 (58 distinct tracks; 16 slots: 83 s, marginal gain). Non-regression: complete GREEN with and without slow RAM, AUX:/NEWCON:/PIPE:/handlers, WB boot, Holiday Lemmings up to the menu.
+- **DF1: — EXTERNAL DRIVE (trackdisk unit 1)** (2026-10-30, branch `feature/df1-support`): (1) **trackdisk**
+  (`src/exec/trackdisk.s`): real units in the device base (`TDU_*`, 16 bytes each at base+34: cache-key high byte,
+  CIA-B PRB value with the drive's select line low, motor latch, head position, idle count, change counter); every
+  PRB write is derived from the unit (no more hard-wired SEL0 values); `Open` fails with `TDERR_BadDriveType` when
+  disk.resource's identifier for DF1-3 is not `DRT_AMIGA` (DF0 always present); `io_Unit = 0` (internal FindName
+  callers) = DF0. **One access at a time**: every `BeginIO` (run in the caller's task) holds the device's
+  SignalSemaphore and publishes the unit in `TD_CUNIT` ($600); `td_disk_present` (insert-disk watch) takes it too.
+  The 8-slot decoded-track cache is shared, keyed `unit << 8 | track`; `CMD_CLEAR`/a disk change drop and
+  `CMD_UPDATE` writes only the unit's slots; an evicted dirty slot of another drive is written on that drive
+  (`TD_BASEP` $750 -> its unit) after a `/CHNG` check, so a swapped disk never receives stale tracks. The VBlank
+  server turns each idle motor off. (2) **file-handler** (`src/dos/handler.s`, `dos_handler`): one process per
+  drive; its context goes into `tc_UserData` and holds the trackdisk request opened on the unit read from the
+  FileSysStartupMsg of the DeviceNode whose `dn_Task` is its port, the mounted volume (`HC_VOLUME`, replaces the
+  global `DL_VOLUME`) and the write context (`HC_OWCTX`, replaces `DOS_OWCTX`). `ofs_read_block` and ofswrite take
+  `io_Unit` from that context (tasks that are not handlers read DF0). (3) **boot** (`src/exec/boot.s`):
+  `fl_node` builds the "DFn" DeviceNodes; `mount_df1` creates the second handler ("dos.handler.df1") and links
+  "DF1" after DF0: only if `GetUnitID(1) == DRT_AMIGA`. `DOS_FSPORT` stays the DF0: port (default handler).
+  Proven under Copperline 1.0.1 (A500, 512K chip, prod ROM): WB 1.3.3 in DF0 + Extras in DF1 -> RAM DISK,
+  Extras 1.3, Workbench1.3 icons (293624 free); 1 drive -> unchanged desktop (301496 free, baseline 301584); DF1 empty
+  at boot then Extras inserted at 75 s -> icon appears. Not supported: DF2/DF3 DeviceNodes (trackdisk opens them),
+  two disks with the same name and date in two drives.
+- **TRACKDISK — FLOPPY READING ×5** (`src/exec/trackdisk.s`, `TD_*` constants from `exec.i`): (1) **motor kept on**: a read leaves the DF0 motor on (`TD_MOTORON`; per unit since DF1: `TDU_MOTOR`); the next one skips the spin-up; a VBlank server (`td_motor_server`, `TD_VBLINT`) turns it off after 2 s of inactivity (`TD_MOTORIDLE`, counter `TD_MOTORCNT`, never during an access: `TD_BUSY`); `td_check_change` preserves the motor state. (2) **seek at the drive's timings**: 3 ms between two steps (`TD_STEPWAIT`), 18 ms of settling after the last one (`TD_SETTLE`), instead of very wide delays. (3) **LRU cache of 8 decoded tracks** (`TD_NCACHE` × 5632 bytes in `MEMF_PUBLIC`, slot per track `TD_CTRK`, age `TD_CAGE`/`TD_CTICK`; fallback to 1 slot if memory is short; flushed on `/CHNG`): replaces the single-track cache — the OFS FAT (root, bitmap, headers, chains) kept coming back to the same tracks. Measurement, complete WB 1.3.3 boot (FS-UAE, real time): SetPatch 78 s → 12 s, end of startup-sequence > 400 s → 87 s; physical reads 222 → 103 (58 distinct tracks; 16 slots: 83 s, marginal gain). Non-regression: complete GREEN with and without slow RAM, AUX:/NEWCON:/PIPE:/handlers, WB boot, Holiday Lemmings up to the menu.
 - **Read-only OFS (D1) DONE** (`src/dos/ofs.s` + `ofs.i`): `ofs_read_file` reads a file by name from DF0: (root → hash → header → data block chain) via trackdisk `CMD_READ`. OFS format locked empirically. Serial marker **D1** (size 1024 + markers @0/@488/@976); RED `OFS_NO_DATACHAIN` (size 488). INTERNAL machinery (no packets).
 - **OFS subdirectories DONE**: `ofs_read_file` now takes a '/'-separated PATH. `ofs_split` splits component by component; `ofs_dir_lookup(dir, comp)` hashes+walks the chain of the CURRENT directory (intermediate USERDIR = sectype 2 → becomes the next directory; last component = file, sectype -3). `ht_size`: read from the block for the root (72), but USERDIRs leave long[3]=0 (measured) → fallback `OFS_HTDEF`=72. The single-component lookups (kickslop/D3DTest/e3cmd) go through the same driver (last=1, root) = non-reg. The shell opens "s/startup-sequence" (the ADF's `s/` subdirectory). Markers **F1BOOTOK**+**E3 CMD RAN OK** now sourced from the subdirectory; RED `OFS_NO_SUBDIR` ('/' = normal char → path looked up in the root → not found → F1BOOTOK/E3 absent, D1/E2 SHELL READY intact).
 - **LoadSeg (D2) DONE** (`src/dos/loadseg.s`): `dos_loadseg`/`dos_unloadseg` load a hunk executable from the OFS, apply the relocations (RELOC32 $3EC) and build the BPTR seglist. Hunk format locked empirically. Serial marker **D2LOADSEG** (emitted by the loaded+relocated code); RED `D2_NO_RELOC`. INTERNAL machinery.
@@ -1247,5 +1455,101 @@ The OS builds itself through a scan of resident modules (struct `Resident`, matc
   **M7k postponed** (decision 2026-10-15): the INTREQR decoding of levels INT1/INT4/INT5 has no real consumer
   today (audio=M4+, disk=M6, serial later) -> folded into the relevant subsystem when it
   arrives, with a real consumer and a real test (not a throwaway synthetic self-test).
+- **Custom-chip parity with 1.3 (2026-11-02)** (`docs/analysis/custom-chips-v34.md` §7): `AddIntServer` enables the
+  chain's INTENA source and `RemIntServer` disables it when the chain empties (`src/exec/interrupts.s`,
+  `execmisc.s`; dev marker `INTSRV INTENA OK`); `LoadView(NULL)` leaves the DMA on, sends the copinit to an empty
+  list and resets the display registers by CPU, and the VBlank server reloads COP2LC even without a View
+  (`src/graphics/graphics_lib.s`); disk.resource enables DSKEN once, trackdisk only arms DSKLEN and leaves the
+  audio ADKCON bits alone (`src/exec/diskres.s`, `trackdisk.s`); graphics init detects PAL/NTSC from the beam and
+  fills the standard-dependent GfxBase fields and ExecBase VBlankFrequency (`gfx_detect_std`).
+  Then the gameport VBlank server rewrites POTGO `$0F00` every frame through `WritePotgo` (inline DISABLE/ENABLE,
+  callable from interrupts) and reports the middle button (`$6A`); `OpenScreen` Height ≤ 0 and the Workbench screen
+  follow NormalDisplayRows (200 lines on NTSC), and the pointer is bounded by `PTR_YLIM` (`src/exec/gameport.s`,
+  `potgo.s`, `src/intuition/screens.s`, `pointer.s`).
+- **Already-specified LVOs implemented (lot 1, 2026-11-02)**:
+  - graphics (`graphics_lib.s`, `area.s`): `InitView`, `InitVPort`, `GetColorMap` (32-entry default table) /
+    `FreeColorMap`, `FreeCopList` (shared with `FreeVPortCopLists`), `FreeCprList` (frees our single-block View
+    list), `WaitBOVP`, `BltPattern` (the AreaEnd/Flood mask renderer `mk_render`, bounded by `MK_COLS`; NULL mask
+    = RectFill without outline), `ScrollVPort`. `MakeVPort` now applies RasInfo `RxOffset`/`RyOffset`
+    (`gfx_scrollpar`: DDFSTRT, BPLCON1, modulos, plane offset, graphics-display §4.4) and `ScrollVPort` patches
+    the same MOVEs in place in the fragment and the displayed list (`gfx_fragmst`, shared with `SetRGB4`).
+    `SetRGB4` returns 0/-1, writes COLORn when vp is NULL and preserves d2/d3.
+  - intuition (`pointer.s`, `screens.s`, `intuition_lib.s`): per-window pointer (`SetPointer`/`ClearPointer`,
+    Window $4A-$51, `it_ptrapply` on activation and when the active window closes, `IB_PTRWIN` selects the
+    offsets used by `it_ptrmoved`); `LockIBase`/`UnlockIBase` (7 semaphores in IntuitionBase); `CurrentTime`
+    on the IntuiMessage clock (`it_now`); `Intuition()` reading its list on the stack; `OpenIntuition` = Open
+    with the open count frozen at 1; `AlohaWorkbench` + WBENCHOPEN/WBENCHCLOSE through "WBenchPort"
+    (`it_wbmsg`); `CloseWorkBench`, `WBenchToFront/Back`, `MoveScreen` (fields only: we display the front screen
+    alone), `MakeScreen`, `ActivateWindow`, `RefreshWindowFrame`.
+  - layers `FattenLayerInfo`/`ThinLayerInfo` (fatten count, flag, extra_size; no extra buffers), console
+    `CDInputHandler` (returns 0), dos `WaitForChar` (ACTION_WAIT_CHAR, served by `conwin`).
+  - Tests: `tests/bltpat_test.s`, `tests/imisc_test.s`, `tests/lmisc_test.s` (run with `tests/garea_probe.sh`);
+    `gdisp_probe` and `iscr_probe` give the spec's values for the functions above.
+- **Lot 2 specs implemented (2026-11-02)**:
+  - exec scheduling (`tasks.s`, `interrupts.s`, `execmisc.s`, `semaphores.s`, spec exec-scheduling-v34): real
+    `Schedule`/`Reschedule`/`Switch`/`Dispatch`/`ExitIntr`/`Exception` vectors on the scheduler paths (Wait goes
+    through -54, Permit/Enable/Reschedule through -42, RemTask(self) through -60, the interrupt exit joins the
+    Schedule body), `tc_Launch`/`tc_Switch` hooks, task exceptions in user mode, the SAR flag (formerly
+    "AttnResched"), V34 message semaphores `Procure`/`Vacate`, `SumKickData`, a polling serial `Debug` monitor
+    (`r`/`g`). Kept: our 4-tick round-robin (the server sets TQE + SAR), Signal's "woken > current" rule.
+    `EB_INTSVL` moved out of KickMemPtr ($222 -> $230).
+  - trackdisk (`trackdisk.s`, spec trackdisk-raw-changeint-v34): `TD_RAWREAD`/`TD_RAWWRITE` (disk.resource
+    `GetUnit`, no sync, optional INDEXSYNC through the FLG relay), real `TD_SEEK`, `TD_GETDRIVETYPE` (3.5"),
+    `TD_REMOVE`, `TD_ADDCHANGEINT`/`TD_REMCHANGEINT`; disk change counts and causes the interrupts on removal and
+    insertion (count = 1 after a boot with a disk). Still synchronous (no unit task): changes are seen on each
+    command and by the handler's 1 s `TD_CHANGESTATE` poll. CMD_RESET/STOP/START/FLUSH return -3. A zero-length
+    CMD_WRITE still loads its track and marks it modified (the next UPDATE writes it, as on 1.3); write
+    precompensation starts at track 81 (probed).
+  - keyboard.device / input.device (`kbddev.s`, `input.s`, `gameport.s`, spec keyboard-input-devices-v34): full
+    command tables, 31-entry event ring with `$7D` overflow, 13-byte READMATRIX, NUMERICPAD qualifier, KDAT reset
+    pulse; input `IND_SETMPORT`/`SETMTYPE`/`SETMTRIG` replay the gameport GPD_SETCTYPE/SETTRIGGER sequence and
+    move the system mouse to port 0 or 1 (`gp_mousesrc`); STOP/START/RESET suspend the system mouse only.
+  - resources (`cia.s`, `potgo.s`, `diskres.s`, `misc.s`, spec resources-v34): cia base in the 1.3 layout
+    (pending mask, IntVector array at $40), real `SetICR`, disabled flags kept pending; `AllocPotBits` grants the
+    OUTxx bits too, `WritePotgo` masks against the shadow; disk.resource `AllocUnit` returns `$FF`, `GiveUnit`
+    deselects the drives; versions 34.1.
+  - dos (`dos_lib.s`, `shell.s`, spec dos-exit-packets-v34): `Exit` returns to pr_ReturnAddr-4 with d0 = code
+    (RemTask when there is no return point); `GetPacket`/`QueuePacket` stay null (the spec's safest option); the
+    shell sets `cli_Result2` after a command, and treats code -1 like a command that could not be loaded
+    (script abandoned whatever FailAt, cli_ReturnCode 0; pr_Result2 0/205/218: "Unknown command <name>" and
+    cli_Result2 0, any other: "Unable to load <name>: <error>" with cli_Result2 kept; probed on 1.3).
+  - intuition ghosting (`gadgets.s`, `menus.s`, specs intuition-gzz-v34 §6.4 and intuition-input-menus-v34 §3.5):
+    a GADGDISABLED gadget is ghosted at every rendering of its list (pattern $4444/$1111 in the window's
+    BlockPen, the screen's for a SCRGADGET, BPen 0, JAM1, over its inclusive box, origin = its layer; SysInfo's
+    cache buttons on a 68000); OnGadget/OffGadget redraw from the gadget to the end of the list, without erasing.
+    Disabled menu titles and items use the same pattern in the menu window's BlockPen, rotated so that its x phase
+    is the screen's (`mn_ghost`); test `tests/ghost_test.s`.
+  - Blitter masks (issue #15): graphics init sets BLTAFWM/BLTALWM to $FFFF. Our drawing uses the CPU, so nothing
+    else wrote them; the 1.3 blits leave them at $FFFF (inferred: Kefrens Desert Dream draws its spaceship with
+    blitter lines without setting the masks, and shows it on 1.3).
+  - Workbench Shells (issue #13, spec dos-cli-v34): Execute closes the "*" output it opened once the CLI has read its
+    input to the end, so EndCLI closes a Shell window; the boot CLI ends after the startup-sequence's EndCLI
+    (`rcli_free` + RemTask), so the first Shell is number 1; console.device CloseDevice unhooks the reads still
+    pending on the closing unit (Newcon-Handler closes without AbortIO, its request lived on its dead stack);
+    proc_create copies the process name into its own tc_MemEntry block, followed by room for a segarray that dos
+    CreateProc uses (`PRX_*` in dospkt.i), so RemTask frees both. One Shell open + EndCLI cycle now leaves 48 bytes
+    (1.3: 56); the first one also caches L:Newcon-Handler (7.5 KB, dn_SegList). Open: a Shell costs ~52 KB here
+    against 33-40 KB on 1.3 (4 KB stack margin per BCPL process, smart-refresh backdrop and drawer windows).
+  - WinUAE suite fixes (2026-11-03, dos-v34-spec §4b, dos-boot-sequence.md): LoadSeg accepts up to 4096 hunks
+    (was 64; Shanghai has 180) and ignores a HUNK_END that follows no CODE/DATA/BSS block (headbanger doubles it);
+    the boot assigns C L S DEVS LIBS FONTS always exist, with lock 0 (= root of the boot volume, dos_resolve takes
+    dn_Task) when the directory is missing, chained S L C FONTS DEVS LIBS SYS as on 1.3; the shell treats TAB as a
+    separator; coldstart lights the power LED (CIA-A PRA bit 1 = 0) after ResModules, because Shanghai's intro
+    compares the whole PRA byte with $BC.
+  - pr_StackSize (issue #16, dos-v34-spec §4a): proc_create writes the stack size it is given, unrounded, so
+    CreateProc and Workbench tools get the value they asked for; rt_createproc stores the BCPL size without our
+    CP_STKEXTRA margin, because c:NewCLI passes its own pr_StackSize on to the CLI it creates. Directory Opus 4.12
+    checks the pr_StackSize of the child it makes with CreateProc(...,16384) and refused to run while it read 0.
+  - strap: the bootblock runs with the interrupts enabled (supervisor, IPL 0, previous SR restored after), and
+    the strap returns the entry point the bootblock gives in A0. When it is dos.library's rt_Init, dos starts on
+    DF0: as before; anything else is a game or demo loaded by its own bootblock, entered in supervisor at IPL 0
+    (1.3 runs such code at IPL 3, never 7: oracle probe). Tintin on the Moon (custom bootblock, non-DOS disk)
+    started AmigaDOS instead of its game; Spaceballs "State of the Art" and Tintin waited forever at IPL 7 on a
+    counter or the blitter. `tests/bootblock_c.s` now returns the dos rt_Init like a standard bootblock.
+  - trackdisk track cache: the 8 slots only in fast memory (slow RAM included), otherwise 1 slot, so that a 512 KB
+    chip-only A500 keeps its chip RAM for games (Bubble Bobble starts again; `docs/MEMORY-USAGE.md`).
+    Debugging tool `tests/allocsnoop.s`: SetFunction spy of AllocMem on the serial port.
+  - Tests (`tests/garea_probe.sh`): `execsched_test.s` (Debug waits for `r`/`g` on serial), `tdraw_test.s`,
+    `kbdinp_test.s`, `res_test.s`; `dosexit_test.s` runs with `tests/dosexit_probe.sh`.
 
 See `docs/PLAN.md` for what comes next and `docs/CLEANROOM.md` for the wall.

@@ -39,8 +39,13 @@
   screen exists and input.device is not open: only the internal data is set.
 - First OpenLibrary (OpenCnt = 0) [O]: re-applies the prefs (§3.3, without copy), then
   **IB+$40 (Flags) := $1000** — which clears bit 16 ("rows/columns already adjusted", §3.3)
-  — then opens timer.device and input.device (IORequest at IB+$182) and installs the input
-  handler (IND_ADDHANDLER, priority 50). So the **first SetPrefs after opening**
+  — then obtains the timer.device base and opens input.device (IORequest at IB+$182) and installs the
+  input handler (IND_ADDHANDLER, priority 50). timer.device is not really opened: OpenDevice is called with
+  the invalid unit −1 on a stack-local request, fails, and only the `io_Device` left by exec is kept
+  (IB+$6C); that request is never closed. Between the prefs and the Flags write, sprite and bitplane DMA are
+  turned off (DMACON `$0020`, `$0100`). `lib_OpenCnt` goes 0 → 1 once and never changes again (Close and
+  Expunge return 0 and do nothing). (*Corrected 2026-11-02, see `intuition-misc-v34.md` §1.1, §1.2.*)
+  So the **first SetPrefs after opening**
   (the one from system-configuration) can still adjust rows/columns, and it is the first one able
   to pass KeyRpt on to input.device.
 
@@ -89,6 +94,7 @@
 | KeyRptSpeed | 0 s, 31,140 µs | 0 s, 100,000 µs |
 | KeyRptDelay | 0 s, 400,000 µs | 0 s, 800,000 µs |
 | DoubleClick | 1 s, 196,800 µs | 1 s, 500,000 µs |
+| PointerMatrix (36 words) | same image as the ROM default | default image (§4.2) |
 | XOffset / YOffset | −2 / −1 | −2 / −1 |
 | colours 17/18/19 | $D22 / $000 / **$ABC** | $D22 / $000 / $FCA |
 | **PointerTicks** | **1** | **2** |
@@ -188,6 +194,11 @@ PointerTicks, FontHeight (computation of a height with fallback on FontHeight + 
   from IB if size ≥ 124.
 - Then, if size ≥ 100: PointerMatrix (36 words, +$1C) := **ROM default image, 36 words**.
   The default table has its PointerMatrix at zero: it is this filling that provides it.
+  Default image [O]: both sprite control word pairs are zero; the arrow fits in the top-left
+  11×11 pixels, its tip on pixel (0,0) (default XOffset/YOffset are still −2/−1). Colour index 2
+  (color18) is the outline; the interior uses two indices, mostly index 1 (color17) and a smaller
+  part in index 3 (color19). It is bit-for-bit identical to the PointerMatrix of the WB 1.3.3
+  `devs:system-configuration`.
 - Return D0 = `buf`. No side effect (nothing is applied).
 - Difference from GetPrefs: ROM source instead of the current copy, and forced pointer image.
 

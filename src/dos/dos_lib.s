@@ -137,7 +137,7 @@ dos_vectors:
         dc.l    dos_fn_currentdir        ; 21: LVO -126 CurrentDir(lock d1) -> old lock
         dc.l    dos_fn_ioerr             ; 22: LVO -132 IoErr() -> pr_Result2
         dc.l    dos_fn_createproc        ; 23: LVO -138 CreateProc(name d1, pri d2, seglist d3, stack d4)
-        dc.l    dos_null                 ; 24: LVO -144 (Exit not implemented)
+        dc.l    dos_fn_exit              ; 24: LVO -144 Exit(code d1): back to pr_ReturnAddr-4, never returns
                 ifeq    LOADSEG_LVO_UNWIRED
         dc.l    dos_fn_loadseg           ; 25: LVO -150 LoadSeg(name d1) -> BPTR seglist
                 endc
@@ -145,7 +145,7 @@ dos_vectors:
         dc.l    dos_null                 ; RED LOADSEG_LVO_UNWIRED: LoadSeg not wired -> jsr -150 returns 0
                 endc
         dc.l    dos_fn_unloadseg         ; 26: LVO -156 UnLoadSeg(seglist d1)
-        dcb.l   2,dos_null               ; 27..28: LVO -162/-168 (GetPacket/QueuePacket, private)
+        dcb.l   2,dos_null               ; 27..28: LVO -162/-168 GetPacket/QueuePacket: no V34 packet function, -> 0
         dc.l    dos_fn_deviceproc        ; 29: LVO -174 DeviceProc(name d1) -> handler port
         dc.l    dos_fn_setcomment        ; 30: LVO -180 SetComment(name d1, comment d2)
         dc.l    dos_fn_setprotection     ; 31: LVO -186 SetProtection(name d1, mask d2)
@@ -656,6 +656,8 @@ dos_fullreq:
         lea     -32(sp),sp              ; volume name in C
         lea     vr_unknown(pc),a4
         moveq   #1,d3
+        move.l  ($4).w,a6
+        jsr     LVO_FORBID(a6)          ; the DF0: handler frees an ejected volume's node (FreeMem overwrites DN_NEXT)
         move.l  DOS_DOSBASE,a0
         move.l  DL_ROOT(a0),a0
         move.l  RN_INFO(a0),d0
@@ -695,6 +697,7 @@ dos_fullreq:
         move.l  DN_NEXT(a0),d0
         bra.s   .fr_node
 .fr_ask:
+        jsr     LVO_PERMIT(a6)          ; the name is copied: the node is no longer needed
         lea     vr_v1(pc),a0
         lea     vr_v3(pc),a1
         moveq   #0,d0                   ; no event counts as Retry
@@ -1214,58 +1217,33 @@ dl_timername:
         even
 
 ; CreateProc(name d1 [C], pri d2, seglist d3 [BPTR], stack d4 [bytes]) -> d0 = MsgPort of the process | 0 (dos AutoDoc).
-; The process starts directly on the code of the first segment; name copied (the caller may free its own),
-; segarray [3, creator's V!1, V!2, seglist] (BCPL spec §8.3, global -18), ConsoleTask/FileSystemTask/WindowPtr
-; and GV inherited from the creator, null current directory. When the code returns (rts), cpr_exit ends the process.
-; Fields set under Forbid before the process first runs.
-CP_NAMEMAX      EQU 32
+; The process starts directly on the code of the first segment; name copied by proc_create (the caller may free its
+; own), segarray [3, creator's V!1, V!2, seglist] (BCPL spec §8.3, global -18) in the room proc_create leaves after
+; the Process (PRX_SEGA), ConsoleTask/FileSystemTask/WindowPtr and GV inherited from the creator, null current
+; directory. When the code returns (rts), cpr_exit ends the process. Fields set under Forbid before it first runs.
 dos_fn_createproc:
         movem.l d2-d7/a2-a6,-(sp)
-        move.l  d1,a2                   ; a2 = name
-        move.l  d2,d5                   ; d5 = pri
-        move.l  d3,d6                   ; d6 = seglist
-        move.l  d4,d7                   ; d7 = stack
         move.l  ($4).w,a6
-        moveq   #CP_NAMEMAX+20,d0       ; name (32) + segarray with getvec header (5 longs)
-        move.l  #(MEMF_PUBLIC|MEMF_CLEAR),d1
-        jsr     LVO_ALLOCMEM(a6)
-        tst.l   d0
-        beq     .cpr_fail
-        move.l  d0,a3                   ; a3 = copied name
-        move.l  a3,a0
-        moveq   #CP_NAMEMAX-2,d1
-.cpr_ncpy:
-        move.b  (a2)+,(a0)+
-        dbeq    d1,.cpr_ncpy
-        lea     CP_NAMEMAX(a3),a4       ; a4 = getvec header of the segarray
-        move.l  #20,(a4)                ; size (for a possible freevec)
-        move.l  #3,4(a4)
-        move.l  d6,16(a4)
-        move.l  EB_THISTASK(a6),a0
-        cmp.b   #NT_PROCESS,LN_TYPE(a0)
-        bne.s   .cpr_noparent
-        move.l  PR_SEGLIST(a0),d0
-        lsl.l   #2,d0
-        beq.s   .cpr_noparent
-        move.l  d0,a1
-        cmp.l   #2,(a1)
-        blt.s   .cpr_noparent
-        move.l  4(a1),8(a4)             ; creator's V!1, V!2
-        move.l  8(a1),12(a4)
-.cpr_noparent:
+        move.l  d3,d6                   ; d6 = seglist
         jsr     LVO_FORBID(a6)
-        move.l  a3,a0
+        move.l  d1,a0                   ; name
         move.l  d6,d0
         lsl.l   #2,d0
         move.l  d0,a1
         addq.l  #4,a1                   ; entry = first segment
-        move.l  d5,d0
-        move.l  d7,d1
+        move.l  d2,d0
+        move.l  d4,d1
         jsr     proc_create             ; d0 = &pr_MsgPort | 0
         move.l  d0,d4
-        beq.s   .cpr_failp
+        beq     .cpr_failp
         move.l  d0,a0
         lea     -PR_MSGPORT(a0),a0      ; a0 = new process
+        lea     PRX_SEGA(a0),a4         ; a4 = getvec header of the segarray
+        move.l  #20,(a4)                ; size (for a possible freevec)
+        move.l  #3,4(a4)
+        clr.l   8(a4)
+        clr.l   12(a4)
+        move.l  d6,16(a4)
         lea     4(a4),a1
         move.l  a1,d0
         lsr.l   #2,d0
@@ -1273,6 +1251,15 @@ dos_fn_createproc:
         move.l  EB_THISTASK(a6),a1
         cmp.b   #NT_PROCESS,LN_TYPE(a1)
         bne.s   .cpr_started
+        move.l  PR_SEGLIST(a1),d0
+        lsl.l   #2,d0
+        beq.s   .cpr_noseg
+        move.l  d0,a2
+        cmp.l   #2,(a2)
+        blt.s   .cpr_noseg
+        move.l  4(a2),8(a4)             ; creator's V!1, V!2
+        move.l  8(a2),12(a4)
+.cpr_noseg:
         move.l  PR_CONSOLETASK(a1),PR_CONSOLETASK(a0)
         move.l  PR_FILESYSTEMTASK(a1),PR_FILESYSTEMTASK(a0)
         move.l  PR_WINDOWPTR(a1),PR_WINDOWPTR(a0)
@@ -1285,32 +1272,66 @@ dos_fn_createproc:
         bra.s   .cpr_ret
 .cpr_failp:
         jsr     LVO_PERMIT(a6)
-        move.l  a3,a1
-        moveq   #CP_NAMEMAX+20,d0
-        jsr     LVO_FREEMEM(a6)
-.cpr_fail:
         moveq   #0,d0
 .cpr_ret:
         movem.l (sp)+,d2-d7/a2-a6
         rts
 
-; cpr_exit: a process launched by CreateProc whose code returns (rts): name + segarray block freed, then RemTask
-; (does not return). Under Forbid: the freed name is no longer visible before the process ends.
+; cpr_exit: finalPC of a process launched by CreateProc, reached by rts or Exit (code discarded): RemTask, which
+; frees the Process block with its name and segarray. The seglist, streams and current directory are left alone
+; (spec dos-exit-packets §1.4). Does not return.
 cpr_exit:
         move.l  ($4).w,a6
-        jsr     LVO_FORBID(a6)
-        move.l  EB_THISTASK(a6),a0
-        move.l  LN_NAME(a0),a1
-        moveq   #CP_NAMEMAX+20,d0
-        jsr     LVO_FREEMEM(a6)
         sub.l   a1,a1
         jsr     LVO_REMTASK(a6)
 .ce_hang:
         bra.s   .ce_hang
 
-; WaitForChar(fh d1, us d2) -> DOSFALSE: no character available (the console does not handle this packet yet).
+; Exit(code d1): SP := pr_ReturnAddr - 4, then rts with d0 = code (spec dos-exit-packets-v34 §1). Nothing is closed or
+; freed here: the long below pr_ReturnAddr decides where it lands - the return point of the CLI/runcommand launch
+; (same as the command returning), or the finalPC of a CreateProc/BCPL process (end of the process). A caller with no
+; return point (plain Task, or pr_ReturnAddr = 0 outside a command) would get a wild SP: it is removed instead.
+dos_fn_exit:
+        move.l  ($4).w,a6
+        move.l  EB_THISTASK(a6),a0
+        cmp.b   #NT_PROCESS,LN_TYPE(a0)
+        bne.s   .ex_task
+        move.l  PR_RETURNADDR(a0),d0
+        beq.s   .ex_task
+        move.l  d0,sp
+        subq.l  #4,sp
+        move.l  d1,d0
+        rts
+.ex_task:
+        sub.l   a1,a1
+        jsr     LVO_REMTASK(a6)
+.ex_hang:
+        bra.s   .ex_hang
+
+; WaitForChar(fh d1 [BPTR FileHandle], timeout d2 [microseconds]) -> d0 = dp_Res1 of ACTION_WAIT_CHAR (-1: a character
+; is available, 0: none within the timeout); pr_Result2 = dp_Res2. A handle without a handler (NIL:) gives 0 at once,
+; Result2 unchanged (spec dos-exit-packets-v34 §2.1). a6 = DosBase on entry. From a PROCESS.
 dos_fn_waitforchar:
+        movem.l d2-d7/a2-a6,-(sp)
+        move.l  d2,d5
+        lsl.l   #2,d1
+        beq.s   .wc_no
+        move.l  d1,a2
+        move.l  FH_TYPE(a2),d0
+        beq.s   .wc_no
+        move.l  d0,a1                   ; handler port
+        move.l  ($4).w,a6
+        lea     -SP_SIZEOF(sp),sp
+        move.l  sp,a0
+        move.l  #ACTION_WAIT_CHAR,d0
+        move.l  d5,d1                   ; ARG1 = timeout
+        jsr     dos_sendpkt
+        lea     SP_SIZEOF(sp),sp
+        bra.s   .wc_ret
+.wc_no:
         moveq   #0,d0
+.wc_ret:
+        movem.l (sp)+,d2-d7/a2-a6
         rts
 
 ; ParentDir(lock d1) -> lock of the parent | 0 (root): ACTION_PARENT to the lock's handler. a6 = DosBase.
@@ -1461,6 +1482,7 @@ dos_resolve:
         sub.l   a4,d3
         subq.l  #1,d3                   ; d3 = length of the prefix
         beq     .rs_volroot             ; ":rest"
+        bsr     rs_forbid               ; the DF0: handler frees an ejected volume's node (FreeMem overwrites DN_NEXT)
         move.l  DL_ROOT(a6),a2
         move.l  RN_INFO(a2),d0
         lsl.l   #2,d0
@@ -1477,7 +1499,7 @@ dos_resolve:
         moveq   #0,d4
         move.b  (a0)+,d4                ; length of the node's name
         cmp.l   d3,d4
-        bne.s   .rs_next
+        bne     .rs_next
         move.l  a4,a1
 .rs_cmp:
         move.b  (a0)+,d0
@@ -1494,17 +1516,26 @@ dos_resolve:
         move.l  DN_LOCK(a2),d6          ; assign: lock of the assigned directory
         move.l  d6,d0
         lsl.l   #2,d0
-        beq.s   .rs_unknown
+        beq.s   .rs_root
         move.l  d0,a0
         move.l  FL_TASK(a0),a3
+        bra.s   .rs_asn
+.rs_root:                               ; lock 0: root of the volume in dn_Task's drive (boot assign of a missing
+        move.l  DN_TASK(a2),a3          ; directory, dos-boot-sequence.md)
+        move.l  a3,d0
+        beq.s   .rs_unknown
+.rs_asn:
+        bsr     rs_permit
         lea     1(a4,d3.l),a4           ; pass on what follows the ':'
         bra     .rs_ret
 .rs_devvol:
         moveq   #0,d6
         move.l  DN_TASK(a2),a3
-        move.l  a3,d0
+        move.l  DN_TYPE(a2),d0
+        bsr     rs_permit               ; a2 is only used further on for a device node, never freed
+        move.l  a3,d1
         bne     .rs_ret
-        tst.l   DN_TYPE(a2)             ; device without a task: start its handler (BCPL spec §13.3)
+        tst.l   d0                      ; device without a task: start its handler (BCPL spec §13.3)
         bne.s   .rs_absent              ; volume known but not in a drive
         ; one startup at a time: the handler only sets dn_Task on receiving its startup packet, and
         ; loading its segment takes long; two processes opening the same device ("run copy x to pipe:a"
@@ -1529,6 +1560,7 @@ dos_resolve:
         move.l  DN_NEXT(a2),d0
         bra     .rs_node
 .rs_unknown:
+        bsr     rs_permit
         tst.l   d3
         beq.s   .rs_fail                ; no prefix: no volume name to ask for
         cmp.l   #3,d3                   ; "NIL:": never a requester (deviceproc spec)
@@ -1563,6 +1595,18 @@ dos_resolve:
         bsr     dos_cdport
 .rs_ret:
         movem.l (sp)+,d3-d4/a2
+        rts
+rs_forbid:
+        movem.l d0-d1/a0-a1/a6,-(sp)
+        move.l  ($4).w,a6
+        jsr     LVO_FORBID(a6)
+        movem.l (sp)+,d0-d1/a0-a1/a6
+        rts
+rs_permit:
+        movem.l d0-d1/a0-a1/a6,-(sp)
+        move.l  ($4).w,a6
+        jsr     LVO_PERMIT(a6)
+        movem.l (sp)+,d0-d1/a0-a1/a6
         rts
 
 ; dos_volreq(a4 = name, d3 = length of the prefix before ':') -> d0 = true if the user chose Retry (or inserted a
@@ -1750,8 +1794,9 @@ dos_upper:
         rts
 
 ; dos_boot_assigns(a6 = DosBase): called by the initial CLI (process) once the boot disk is mounted. Creates the
-; VOLUME node (name read by Examine of the root), the SYS: assign (root) and the C: S: L: DEVS: LIBS: FONTS: assigns for
-; each directory present on DF0:, then sets pr_CurrentDir = root. No readable disk -> nothing. Preserves everything.
+; VOLUME node (name read by Examine of the root), the SYS: assign (root) and the C: S: L: DEVS: LIBS: FONTS: assigns
+; (lock 0 when the directory is missing), then sets pr_CurrentDir = root. No readable disk -> nothing. Preserves
+; everything.
 BA_PATHMAX      EQU 48
 dos_boot_assigns:
         movem.l d0-d7/a0-a6,-(sp)
@@ -1790,9 +1835,8 @@ dos_boot_assigns:
         moveq   #SHARED_LOCK,d2
         bsr     dos_fn_lock
         clr.b   0(sp,d5.l)              ; "NAME:" again
-        tst.l   d0
-        beq.s   .ba_loop                ; directory missing -> no assign
-        move.l  d0,d1
+        move.l  d0,d1                   ; directory missing -> assign with lock 0 = root of the boot volume, as on 1.3
+                                        ; (Lemmings demo runs C:LEMMINGS!!! with no c directory, dos-boot-sequence.md)
         moveq   #DLT_DIRECTORY,d0
         move.l  a3,a0
         move.l  a4,a1
@@ -2135,13 +2179,13 @@ ba_df0:
         dc.b    "DF0",0
 ba_sysname:
         dc.b    "SYS",0
-ba_tab:
-        dc.b    "C",0,"c",0
-        dc.b    "S",0,"s",0
-        dc.b    "L",0,"l",0
-        dc.b    "DEVS",0,"devs",0
+ba_tab:                                 ; added at the head: the chain reads S L C FONTS DEVS LIBS SYS, as on 1.3
         dc.b    "LIBS",0,"libs",0
+        dc.b    "DEVS",0,"devs",0
         dc.b    "FONTS",0,"fonts",0
+        dc.b    "C",0,"c",0
+        dc.b    "L",0,"l",0
+        dc.b    "S",0,"s",0
         dc.b    0
         EVEN
 
@@ -2151,7 +2195,6 @@ dos_initfunc:
         movem.l d3/a2,-(sp)         ; a2/d3 non-scratch: preserved for MakeLibrary (AllocMem preserves them too)
         move.l  d0,a2               ; a2 = DosBase
         move.l  d0,DOS_DOSBASE      ; published for the BCPL runtime (no a6 = DosBase in BCPL code)
-        clr.l   DOS_OWCTX           ; low memory not cleared on reset
         lea     DOS_HSEM,a0
         jsr     LVO_INITSEMAPHORE(a6)
         lea     dos_name(pc),a0

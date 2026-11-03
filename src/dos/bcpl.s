@@ -36,6 +36,7 @@
                 xref    ser_puthex
                 xref    dos_resolve          ; dos_lib.s: name -> handler port + lock (deviceproc)
                 xref    dos_sendpkt          ; process.s: synchronous packet (a0 = StandardPacket, a1 = port)
+                xref    dos_waitreply        ; process.s: wait for our message, other ones put back
 
 GV_NEGSLOTS     EQU 50               ; slots -50..-1
 GV_MAX          EQU 150              ; GV[0] = highest allowed global
@@ -401,19 +402,11 @@ bcpl_starthandler:
         move.l  d2,DP_RES2(a0)
         move.l  a3,a0
         jsr     LVO_PUTMSG(a6)       ; PutMsg(port a0, message a1)
-.sh_wait:
+        bsr.s   .sh_msg
         move.l  d6,a0
-        jsr     LVO_WAITPORT(a6)
-        move.l  d6,a0
-        jsr     LVO_GETMSG(a6)
-        move.l  sp,d1
-        btst    #1,d1
-        beq.s   .sh_galign
-        addq.l  #2,d1
-.sh_galign:
-        cmp.l   d1,d0
-        bne.s   .sh_wait
-        move.l  d0,a0
+        jsr     dos_waitreply        ; other messages of the port are put back, not dropped
+        bsr.s   .sh_msg
+        move.l  a1,a0
         move.l  SP_PKT+DP_RES1(a0),d7
         move.l  SP_PKT+DP_RES2(a0),d2
         lea     SP_SIZEOF+2(sp),sp
@@ -439,6 +432,14 @@ bcpl_starthandler:
         moveq   #0,d0
 .sh_ret:
         movem.l (sp)+,d1-d7/a0-a6
+        rts
+.sh_msg:                             ; a1 = our message (long-aligned in the caller's frame, above this return address)
+        lea     4(sp),a1
+        move.l  a1,d0
+        btst    #1,d0
+        beq.s   .sm_ret
+        addq.l  #2,a1
+.sm_ret:
         rts
 .sh_free_a4:                         ; free the BSTR of the full name (a4 = BPTR | 0)
         move.l  a4,d0
@@ -751,6 +752,11 @@ rt_unrdch:
         rts
 
 ; --- output buffer of writef & co: a3 = position, a5 = start (on the caller's stack, WF_BUFSZ) ---
+; WF_BUFSZ(a5) = wrch routine to send the characters to, 0 = straight to the output stream. BCPL output goes through
+; the wrch of the GV: Ed points global 56 at its own screen buffer around its writef calls (cursor positioning),
+; so the characters must reach that routine, not the current stream.
+WF_WRCH         EQU WF_BUFSZ
+WF_FRAMEGAP     EQU 128              ; the called wrch's frame starts this far above the global's frame (its arguments)
 ; wf_putc(d0.b): appends a character, flushes if full. Preserves everything except a3.
 wf_putc:
         move.b  d0,(a3)+
@@ -761,6 +767,8 @@ wf_putc:
         movem.l (sp)+,d0             ; movem does not touch the CCR
         blo     wf_ret
 wf_flush:                            ; flushes the buffer (a5..a3); preserves everything except a3 (reset to a5)
+        tst.l   WF_WRCH(a5)
+        bne.s   wf_gvout
         movem.l d0/a0,-(sp)
         move.l  a3,d0
         sub.l   a5,d0
@@ -769,6 +777,46 @@ wf_flush:                            ; flushes the buffer (a5..a3); preserves ev
         move.l  a5,a3
         movem.l (sp)+,d0/a0
 wf_ret:
+        rts
+wf_gvout:                            ; one BCPL call per character, with the global's own frame and GV
+        movem.l d0-d7/a0-a6,-(sp)
+        move.l  WF_WRCH(a5),-(sp)    ; 8(sp) = routine
+        move.l  a3,-(sp)             ; 4(sp) = end
+        move.l  a5,-(sp)             ; (sp) = cursor
+        move.l  WF_WRCH+4+4(a5),a1   ; a1 and a2 saved by BENTER just above the buffer
+        move.l  WF_WRCH+4+8(a5),a2
+.gv_lp:
+        move.l  (sp),a3
+        cmp.l   4(sp),a3
+        bhs.s   .gv_end
+        moveq   #0,d1
+        move.b  (a3)+,d1
+        move.l  a3,(sp)
+        move.l  8(sp),a4
+        sub.l   a0,a0
+        move.l  #WF_FRAMEGAP,d0
+        lea     bcpl_call(pc),a5
+        lea     bcpl_ret(pc),a6
+        jsr     (a5)
+        bra.s   .gv_lp
+.gv_end:
+        lea     12(sp),sp
+        movem.l (sp)+,d0-d7/a0-a6
+        move.l  a5,a3
+        rts
+
+; wf_gvsel(a5 = buffer opened right after BENTER): WF_WRCH := global 56 of the caller's GV if it is no longer our wrch.
+wf_gvsel:
+        movem.l d0/a0,-(sp)
+        move.l  WF_WRCH+4+8(a5),a0   ; a2 = GV, saved by BENTER
+        move.l  56*4(a0),d0
+        lea     g_wrch(pc),a0
+        cmp.l   a0,d0
+        bne.s   .gs_set
+        moveq   #0,d0
+.gs_set:
+        move.l  d0,WF_WRCH(a5)
+        movem.l (sp)+,d0/a0
         rts
 
 ; wf_bstr(d1 = BSTR) -> writes the characters; d2 = number written. Preserves d1.
@@ -1338,12 +1386,9 @@ rt_createproc:
         movem.l d1-d2/a0-a1/a3/a6,-(sp)
         move.l  ($4).w,a6
         move.l  d1,d2                ; d2 = GV
-        moveq   #32,d0               ; C name (lives as long as the process)
-        move.l  #(MEMF_PUBLIC|MEMF_CLEAR),d1
-        jsr     LVO_ALLOCMEM(a6)
-        tst.l   d0
-        beq     .cp_fail
-        move.l  d0,a0
+        lea     -32(sp),sp           ; C name, copied by proc_create into the process block
+        move.l  sp,a0
+        clr.b   (a0)
         move.l  d4,d1
         lsl.l   #2,d1
         beq.s   .cp_named
@@ -1358,21 +1403,24 @@ rt_createproc:
         move.b  (a1)+,(a0)+
 .cp_ncpy:
         dbra    d1,.cp_nlp
+        clr.b   (a0)
 .cp_named:
-        move.l  d0,-(sp)             ; C name (freed if the creation fails)
-        move.l  d0,a0
+        move.l  sp,a0
         jsr     LVO_FORBID(a6)
         lea     bcpl_proc_entry(pc),a1
         move.l  d7,d0
         move.l  d6,d1
         jsr     proc_create          ; d0 = &pr_MsgPort | 0
-        move.l  (sp)+,a3             ; (Permit may clobber a0/a1)
+        lea     32(sp),sp
         tst.l   d0
         beq.s   .cp_failp
         move.l  d0,a0
         lea     -PR_MSGPORT(a0),a0   ; a0 = new process
         bsr     rt_this              ; a3 = creator
         move.l  d5,PR_SEGLIST(a0)
+        move.l  d6,d1
+        sub.l   #CP_STKEXTRA,d1      ; pr_StackSize = the BCPL size without our margin: c:NewCLI passes it on
+        move.l  d1,PR_STACKSIZE(a0)
         tst.l   d2
         bne.s   .cp_gv
         move.l  PR_GLOBVEC(a3),d2
@@ -1385,10 +1433,6 @@ rt_createproc:
         bra.s   .cp_ret
 .cp_failp:
         jsr     LVO_PERMIT(a6)
-        move.l  a3,a1
-        moveq   #32,d0
-        jsr     LVO_FREEMEM(a6)
-.cp_fail:
         moveq   #103,d0
         bsr     rt_setr2
         moveq   #0,d0
@@ -1660,11 +1704,9 @@ bcpl_execute:
         lea     16(sp),sp
         move.l  (sp)+,PR_SEGLIST(a3)
         move.l  DOS_DOSBASE,a6
-        tst.l   d2
-        bpl.s   .ex_owned               ; the created CLI owns the output
-        move.l  d3,d1
-        beq.s   .ex_owned
-        jsr     DOS_LVO_CLOSE(a6)
+        move.l  d3,d1                   ; the "*" opened here: Execute returns once the CLI has read its input to
+        beq.s   .ex_owned               ; the end, and a CLI created by Run leaves the output it was given open
+        jsr     DOS_LVO_CLOSE(a6)       ; (a Workbench Shell window closes after EndCLI only then)
 .ex_owned:
         move.l  d4,d1
         jsr     DOS_LVO_UNLOADSEG(a6)
@@ -1943,13 +1985,9 @@ g_sendpkt:
         move.l  sp,a1                ; a1 = message
         move.l  MN_SIZE(sp),a0       ; a0 = destination (argument 2)
         jsr     LVO_PUTMSG(a6)       ; PutMsg(port a0, message a1)
-.sk_wait:
         move.l  a3,a0
-        jsr     LVO_WAITPORT(a6)
-        move.l  a3,a0
-        jsr     LVO_GETMSG(a6)
-        tst.l   d0
-        beq     .sk_wait
+        move.l  sp,a1
+        jsr     dos_waitreply
         move.l  DP_RES1(a4),d0
         move.l  DP_RES2(a4),d1
         jsr     dos_pktretry         ; volume ejected: "Please replace volume", Retry -> resend
@@ -2015,14 +2053,21 @@ g_output:
         jmp     (a6)
 
 ; --- formatted output: each global opens a WF_BUFSZ buffer on the stack (a5 = start, a3 = position) ---
-WFOPEN          MACRO
-        lea     -WF_BUFSZ(sp),sp
+WFOPEN          MACRO                ; in a BCPL global, right after BENTER
+        lea     -WF_BUFSZ-4(sp),sp
         move.l  sp,a5
         move.l  sp,a3
+        bsr     wf_gvsel
+                ENDM
+WFRAW           MACRO                ; called from assembly (no GV): straight to the output stream
+        lea     -WF_BUFSZ-4(sp),sp
+        move.l  sp,a5
+        move.l  sp,a3
+        clr.l   WF_WRCH(a5)
                 ENDM
 WFCLOSE         MACRO
         bsr     wf_flush
-        lea     WF_BUFSZ(sp),sp
+        lea     WF_BUFSZ+4(sp),sp
                 ENDM
 
 ; 53 writet(s, w): BSTR then spaces up to w columns.
@@ -2496,16 +2541,16 @@ rt_tplflags:
         movem.l (sp)+,d1-d5/a0
         rts
 
-; rt_tplcount(d1 = BSTR template) -> d0 = number of keys (0 for an empty template).
+; rt_tplcount(d1 = BSTR template) -> d0 = number of keys = commas + 1. Empty names are keys, so an empty template is
+; one positional key (spec §5.4): the 1.2 Echo reads its text with rdargs("").
 rt_tplcount:
         movem.l d1/d5/a0,-(sp)
-        moveq   #0,d0
+        moveq   #1,d0
         lsl.l   #2,d1
         move.l  d1,a0
         moveq   #0,d5
         move.b  (a0)+,d5
         beq     .tc_ret
-        moveq   #1,d0
 .tc_lp:
         cmp.b   #',',(a0)+
         bne     .tc_next
@@ -2789,7 +2834,7 @@ rt_fault:
         move.l  DOS_DOSBASE,a6
         jsr     DOS_LVO_UNLOADSEG(a6)
 .rf_fallback:
-        WFOPEN
+        WFRAW
         lea     ft_msg(pc),a0
 .rf_lp:
         move.b  (a0)+,d0

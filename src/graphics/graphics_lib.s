@@ -15,11 +15,13 @@
 ; --- graphics.library ROMTag (scanned by build_reslist) ---
         EVEN
 ; drawing primitives: src/graphics/draw.s
-                xdef    gfx_OwnBlitter       ; draw.s (ScrollRaster with the blitter)
                 xdef    gfx_DisownBlitter
                 xref    gfx_BltTemplate
+                xref    gfx_SyncSBitMap
+                xref    gfx_CopySBitMap
                 xref    gfx_InitArea
                 xref    gfx_InitTmpRas
+                xref    gfx_BltPattern
                 xref    gfx_AreaMove
                 xref    gfx_AreaDraw
                 xref    gfx_AreaEllipse
@@ -141,7 +143,7 @@ graphics_vectors:                    ; ABSOLUTE table, vector N -> LVO -6*N, com
         dc.l    gfx_AreaEllipse          ; 31: LVO -186 AreaEllipse(rp a1, cx d0, cy d1, a d2, b d3)
         dc.l    gfx_LoadRGB4             ; 32: LVO -192 LoadRGB4(vp a0, colours a1, count d0)
         dc.l    gfx_InitRastPort         ; 33: LVO -198
-        dc.l    graphics_null            ; 34: LVO -204 (not implemented)
+        dc.l    gfx_InitVPort            ; 34: LVO -204 InitVPort(vp a0)
         dc.l    gfx_MrgCop               ; 35: LVO -210
         dc.l    gfx_MakeVPort            ; 36: LVO -216
         dc.l    gfx_LoadView             ; 37: LVO -222
@@ -159,7 +161,7 @@ graphics_vectors:                    ; ABSOLUTE table, vector N -> LVO -6*N, com
         dc.l    gfx_QBlit                ; 49: LVO -294 QBSBlit(bltnode a1): like QBlit (spec §9.4, gb_VBlank = 0)
         dc.l    gfx_BltClear             ; 50: LVO -300 BltClear(memory a1, size d0, flags d1)
         dc.l    gfx_RectFill             ; 51: LVO -306
-        dc.l    graphics_null            ; 52: LVO -312 (not implemented)
+        dc.l    gfx_BltPattern           ; 52: LVO -312 BltPattern(rp a1, mask a0, xl d0, yl d1, maxX d2, maxY d3, bpr d4)
         dc.l    gfx_ReadPixel            ; 53: LVO -318
         dc.l    gfx_WritePixel           ; 54: LVO -324
         dc.l    gfx_Flood                ; 55: LVO -330 Flood(rp a1, mode d2, x d0, y d1)
@@ -167,21 +169,22 @@ graphics_vectors:                    ; ABSOLUTE table, vector N -> LVO -6*N, com
         dc.l    gfx_SetAPen              ; 57: LVO -342
         dc.l    gfx_SetBPen              ; 58: LVO -348
         dc.l    gfx_SetDrMd              ; 59: LVO -354
-        dc.l    graphics_null            ; 60: LVO -360 InitView (not impl.)
+        dc.l    gfx_InitView             ; 60: LVO -360 InitView(view a1)
         dc.l    gfx_CBump                ; 61: LVO -366 CBump(ucl a1)
         dc.l    gfx_CMove                ; 62: LVO -372 CMove(ucl a1, register d0, value d1)
         dc.l    gfx_CWait                ; 63: LVO -378 CWait(ucl a1, v d0, h d1)
         dc.l    gfx_VBeamPos             ; 64: LVO -384 VBeamPos()
         dc.l    gfx_InitBitMap           ; 65: LVO -390
         dc.l    gfx_ScrollRaster         ; 66: LVO -396
-        dc.l    graphics_null            ; 67: LVO -402 WaitBOVP (not implemented)
+        dc.l    gfx_WaitBOVP             ; 67: LVO -402 WaitBOVP(vp a0)
         dc.l    gfx_GetSprite            ; 68: LVO -408
         dc.l    gfx_FreeSprite           ; 69: LVO -414 FreeSprite(number d0)
         dc.l    gfx_ChangeSprite         ; 70: LVO -420
         dc.l    gfx_MoveSprite           ; 71: LVO -426
         dc.l    gfx_LockLayerRom         ; 72: LVO -432
         dc.l    gfx_UnlockLayerRom       ; 73: LVO -438
-        dcb.l   2,graphics_null          ; 74..75: LVO -444..-450 (not implemented)
+        dc.l    gfx_SyncSBitMap          ; 74: LVO -444 SyncSBitMap(layer a0)
+        dc.l    gfx_CopySBitMap          ; 75: LVO -450 CopySBitMap(layer a0)
         dc.l    gfx_OwnBlitter           ; 76: LVO -456
         dc.l    gfx_DisownBlitter        ; 77: LVO -462
         dc.l    gfx_InitTmpRas           ; 78: LVO -468 InitTmpRas(tmpRas a0, buffer a1, size d0)
@@ -197,12 +200,14 @@ graphics_vectors:                    ; ABSOLUTE table, vector N -> LVO -6*N, com
         dc.l    gfx_ClearRegion          ; 88: LVO -528
         dc.l    gfx_DisposeRegion        ; 89: LVO -534
         dc.l    gfx_FreeVPortCopLists    ; 90: LVO -540
-        dc.l    graphics_null            ; 91: LVO -546 FreeCopList (not implemented)
+        dc.l    gfx_FreeCopList          ; 91: LVO -546 FreeCopList(coplist a0)
         dc.l    gfx_ClipBlit             ; 92: LVO -552 ClipBlit(source rp a0, ..., dest rp a1, ..., minterm d6)
         dc.l    gfx_XorRectRegion        ; 93: LVO -558
-        dcb.l   3,graphics_null          ; 94..96: LVO -564..-576 (not implemented)
+        dc.l    gfx_FreeCprList          ; 94: LVO -564 FreeCprList(cprlist a0)
+        dc.l    gfx_GetColorMap          ; 95: LVO -570 GetColorMap(entries d0) -> d0
+        dc.l    gfx_FreeColorMap         ; 96: LVO -576 FreeColorMap(colormap a0)
         dc.l    gfx_GetRGB4              ; 97: LVO -582 GetRGB4(colormap a0, n d0)
-        dc.l    graphics_null            ; 98: LVO -588 ScrollVPort (not implemented)
+        dc.l    gfx_ScrollVPort          ; 98: LVO -588 ScrollVPort(vp a0)
         dc.l    gfx_UCopperListInit      ; 99: LVO -594 UCopperListInit(ucl a0, count d0)
         dc.l    gfx_FreeGBuffers         ; 100: LVO -600
         dc.l    gfx_BltBitMapRastPort    ; 101: LVO -606
@@ -246,20 +251,16 @@ graphics_initfunc:
         move.l  #(MEMF_CHIP|MEMF_CLEAR),d1
         jsr     LVO_ALLOCMEM(a6)
         move.l  d0,gb_SprNull(a2)
-        move.b  #50,gb_VBlank(a2)    ; PAL display (European A500): public values read by programs
         move.w  #GFX_COLOR_BIT,gb_system_bplcon0(a2)
-        move.w  #DISPF_PAL,gb_DisplayFlags(a2)
-        move.w  #312,gb_MaxDisplayRow(a2)
-        move.w  #452,gb_MaxDisplayColumn(a2)
-        move.w  #256,gb_NormalDisplayRows(a2)
-        move.w  #640,gb_NormalDisplayColumns(a2)
-        move.w  #1280,gb_NormalDPMX(a2)
-        move.w  #1280,gb_NormalDPMY(a2)
-        move.w  #64*256,gb_MicrosPerLine(a2)
+        bsr     gfx_detect_std       ; PAL or NTSC: public GfxBase values + ExecBase VBlankFrequency
+        move.b  EB_VBLANKFREQ(a6),gb_VBlank(a2)
         lea     gb_BlitSem(a2),a0
         jsr     LVO_INITSEMAPHORE(a6)
         move.w  #(DMAF_SETCLR|DMAF_MASTER|DMAF_BLITTER),DMACON ; blitter permanently enabled, like 1.3: a
-        jsr     gfx_fontinit         ; program that saves then restores DMACON must find it again
+                                     ; program that saves then restores DMACON must find it again
+        move.l  #-1,CUSTOM+$044      ; BLTAFWM/BLTALWM = $FFFF, as the 1.3 blits leave them: our drawing uses the
+                                     ; CPU, and demos that draw lines with the blitter rely on the masks (Kefrens)
+        jsr     gfx_fontinit
         moveq   #GFX_COPINIT_SIZE,d0 ; copinit (COP1LC): wait for line 12 then jump to COP2LC
         move.l  #(MEMF_CHIP|MEMF_CLEAR),d1
         jsr     LVO_ALLOCMEM(a6)
@@ -275,17 +276,69 @@ graphics_initfunc:
         lea     gb_vbsrv(a2),a1
         move.b  #GFX_VBPRI,LN_PRI(a1)
         lea     gfx_vblank(pc),a0
-        bsr.s   gfx_intinit
+        bsr     gfx_intinit
         moveq   #INTB_VERTB,d0
         jsr     LVO_ADDINTSERVER(a6)
         lea     gb_bltsrv(a2),a1     ; blitter vector: some programs look for GfxBase there (iv_Data)
         lea     gfx_bltint(pc),a0
-        bsr.s   gfx_intinit
+        bsr     gfx_intinit
         moveq   #INTB_BLIT,d0
         jsr     LVO_SETINTVECTOR(a6)
         move.l  a2,d0
         move.l  (sp)+,a2
         rts
+
+; gfx_detect_std(GfxBase a2, SysBase a6): the standard is the Agnus's, read from the beam as 1.3 does
+; (graphics-display-v34 §8.1; the Agnus ID bits of VPOSR are never used): a line above 270 means PAL; climbing
+; above 100 then wrapping below 50 without passing 270 means NTSC. Bounded loop (PAL if the beam never moves).
+; Fills the standard-dependent GfxBase fields (§1.8) and ExecBase VBlankFrequency. Clobbers d0/d1/a0.
+gfx_detect_std:
+        move.l  d2,-(sp)
+        move.l  #10000,d2            ; ~20 us per pass on a 7 MHz 68000: ~10 frames before giving up
+        moveq   #0,d1                ; d1 = 1 once the beam was seen above line 100
+.ds_lp:
+        bsr     gfx_VBeamPos
+        cmp.w   #270,d0
+        bhi.s   .ds_pal
+        cmp.w   #100,d0
+        bls.s   .ds_low
+        moveq   #1,d1
+        bra.s   .ds_next
+.ds_low:
+        tst.b   d1
+        beq.s   .ds_next
+        cmp.w   #50,d0
+        bcs.s   .ds_ntsc
+.ds_next:
+        subq.l  #1,d2
+        bne.s   .ds_lp
+.ds_pal:
+        lea     gfx_std_pal(pc),a0
+        bra.s   .ds_set
+.ds_ntsc:
+        lea     gfx_std_ntsc(pc),a0
+.ds_set:
+        move.b  (a0)+,EB_VBLANKFREQ(a6)
+        addq.l  #1,a0
+        move.w  (a0)+,gb_DisplayFlags(a2)
+        move.w  (a0)+,gb_MaxDisplayRow(a2)
+        move.w  (a0),PTR_YLIM        ; the intuition pointer stays within the display height
+        move.w  (a0)+,gb_NormalDisplayRows(a2)
+        move.w  (a0)+,gb_NormalDPMX(a2)
+        move.w  (a0)+,gb_NormalDPMY(a2)
+        move.w  #$1D1,gb_MaxDisplayColumn(a2) ; the same for both standards
+        move.w  #640,gb_NormalDisplayColumns(a2)
+        move.w  #$3F9D,gb_MicrosPerLine(a2)
+        move.w  #$30,gb_MinDisplayColumn(a2)
+        move.l  (sp)+,d2
+        rts
+; VBlankFrequency (+ pad), DisplayFlags, MaxDisplayRow, NormalDisplayRows, NormalDPMX, NormalDPMY (spec §1.8, §8.2)
+gfx_std_pal:
+        dc.b    50,0
+        dc.w    DISPF_PAL,311,256,$4CA,$513
+gfx_std_ntsc:
+        dc.b    60,0
+        dc.w    DISPF_NTSC,261,200,$500,$44A
 
 ; gfx_intinit(interrupt a1, code a0, GfxBase a2): NT_INTERRUPT node named "graphics.library", is_Data = GfxBase.
 gfx_intinit:
@@ -301,12 +354,10 @@ gfx_bltint:
         move.w  #INTF_BLIT,INTREQ-CUSTOM(a0)
         rts
 
-; gfx_vblank(a1 = GfxBase): VBlank server. Reloads COP2LC with the list of the displayed view: a program that writes
-; COP2LC with interrupts off sees its list executed by the copinit until it re-enables them (Caesar's FLT
-; intro). Returns Z = 1 (the chain continues).
+; gfx_vblank(a1 = GfxBase): VBlank server. Reloads COP2LC with gb_LOFlist (the displayed view's list, or the empty
+; list after LoadView(NULL)), as 1.3 does: a program that writes COP2LC with interrupts off sees its list executed
+; by the copinit until it re-enables them (Caesar's FLT intro). Returns Z = 1 (the chain continues).
 gfx_vblank:
-        tst.l   gb_ActiView(a1)
-        beq.s   .vb_ret
         move.l  gb_LOFlist(a1),d0
         beq.s   .vb_ret
         move.l  d0,COP2LC
@@ -320,6 +371,7 @@ gfx_copinit:
         dc.w    COPJMP2-CUSTOM,0     ; jump to COP2LC
         dc.w    $FFFF,$FFFE
 GFX_COPINIT_SIZE EQU 12
+GFX_COPINIT_END  EQU 8               ; offset of the final WAIT: the empty list of LoadView(NULL)
 
 ; === M4c2: display engine (copper list GENERATED from the structures) ===
 ; Amiga convention for the 3 functions: a6 = GfxBase, preserve d2-d7/a2-a6, scratch d0/d1/a0/a1.
@@ -332,7 +384,7 @@ GFX_COPINIT_SIZE EQU 12
 ; colours COLOR00..COLOR(Count-1) from ColorTable. An existing fragment is reused (cleared then rewritten).
 ; view unused (only 1 ViewPort). No final WAIT (added by MrgCop).
 gfx_MakeVPort:
-        movem.l d2/d3/d4/d5/a2/a3/a4/a6,-(sp)
+        movem.l d2-d7/a2/a3/a4/a6,-(sp)
         move.l  a1,a2                ; a2 = ViewPort
         move.l  vp_DspIns(a2),d0
         bne.s   .mv_have
@@ -352,32 +404,17 @@ gfx_MakeVPort:
         move.l  a3,a1                ; a1 = write pointer
         move.l  vp_RasInfo(a2),a0
         move.l  ri_BitMap(a0),a4     ; a4 = BitMap
-        lea     gfx_win_over(pc),a0  ; a0 = DIWSTRT, DDFSTRT, DDFSTOP, bytes fetched per row
-        move.w  #GFX_DIWSTOP,d1
-        tst.w   vp_Modes(a2)
-        bpl.s   .mv_lo
-        lea     gfx_win_hires(pc),a0
-        bra.s   .mv_std
-.mv_lo:
-        cmp.w   #320,vp_DWidth(a2)
-        bhi.s   .mv_emit             ; > 320 px in low resolution: overscan
-        lea     gfx_win_lores(pc),a0
-.mv_std:
-        move.w  vp_DHeight(a2),d1    ; DIWSTOP: vstop = $2C + DHeight (V8 derived from V7 by the hardware)
-        add.w   #$2C,d1
-        lsl.w   #8,d1
-        move.b  #$C1,d1
-.mv_emit:
+        bsr     gfx_vpwin
         move.w  #DIWSTRT-CUSTOM,(a1)+
         move.w  (a0)+,(a1)+
         move.w  #DIWSTOP-CUSTOM,(a1)+
         move.w  d1,(a1)+
+        bsr     gfx_scrollpar
         move.w  #DDFSTRT-CUSTOM,(a1)+
-        move.w  (a0)+,(a1)+
+        move.w  d0,(a1)+
         move.w  #DDFSTOP-CUSTOM,(a1)+
-        move.w  (a0)+,(a1)+
-        move.w  bm_BytesPerRow(a4),d5
-        sub.w   (a0)+,d5             ; d5 = modulo
+        move.w  2(a0),(a1)+
+        move.w  d6,d5                ; d5 = modulo
         moveq   #0,d4
         move.b  bm_Depth(a4),d4      ; d4 = depth (plane counter)
         move.w  d4,d2
@@ -391,7 +428,8 @@ gfx_MakeVPort:
         move.w  #BPLCON0-CUSTOM,(a1)+
         move.w  d2,(a1)+
         move.w  #BPLCON1-CUSTOM,(a1)+
-        move.w  #0,(a1)+
+        swap    d6
+        move.w  d6,(a1)+             ; fine scroll
         move.w  #BPLCON2-CUSTOM,(a1)+
         move.w  #GFX_BPLCON2,(a1)+   ; sprites in front of both playfields (pointer visible everywhere)
         move.w  #BPL1MOD-CUSTOM,(a1)+
@@ -402,7 +440,8 @@ gfx_MakeVPort:
         lea     bm_Planes(a4),a0     ; a0 = &Planes[0]
         move.w  #BPL1PTH-CUSTOM,d3   ; d3 = offset of the current BPLxPTH register
 .mv_plane:
-        move.l  (a0)+,d5             ; d5 = address of plane i
+        move.l  (a0)+,d5             ; d5 = address of plane i + RasInfo offset
+        add.l   d7,d5
         move.w  d3,(a1)+             ; BPLxPTH
         move.l  d5,d2
         swap    d2
@@ -427,7 +466,191 @@ gfx_MakeVPort:
         bsr     gfx_ucopemit         ; user instructions (vp_UCopIns) at the end of the fragment
         move.l  a3,vp_DspIns(a2)     ; publishes the fragment
 .mv_ret:
-        movem.l (sp)+,d2/d3/d4/d5/a2/a3/a4/a6
+        movem.l (sp)+,d2-d7/a2/a3/a4/a6
+        rts
+
+; gfx_vpwin(vp a2) -> a0 = window table (DIWSTRT, DDFSTRT, DDFSTOP, bytes fetched per row), d1 = DIWSTOP.
+; HIRES 640 px; low resolution 320 px, or overscan 352x272 if DWidth > 320; standard windows end DHeight lines
+; below line $2C.
+gfx_vpwin:
+        lea     gfx_win_over(pc),a0
+        move.w  #GFX_DIWSTOP,d1
+        tst.w   vp_Modes(a2)
+        bpl.s   .vw_lo
+        lea     gfx_win_hires(pc),a0
+        bra.s   .vw_std
+.vw_lo:
+        cmp.w   #320,vp_DWidth(a2)
+        bhi.s   .vw_ret
+        lea     gfx_win_lores(pc),a0
+.vw_std:
+        move.w  vp_DHeight(a2),d1    ; vstop = $2C + DHeight (V8 derived from V7 by the hardware)
+        add.w   #$2C,d1
+        lsl.w   #8,d1
+        move.b  #$C1,d1
+.vw_ret:
+        rts
+
+; gfx_scrollpar(a0 = DDFSTRT entry of the window table, a2 = vp, a4 = BitMap) -> d0.w = DDFSTRT, d6 = BPLCON1
+; (high word) : modulo (low word), d7.l = plane offset. RasInfo RxOffset/RyOffset as in graphics-display §4.4:
+; offset = RyOffset * BytesPerRow + 2 * (rx >> 4) (HIRES: rx halved, >> 3); a fine scroll s = (-rx) & 15 (7 in
+; HIRES) fetches one more word: DDFSTRT - 8, modulo - 2 (HIRES - 4, offset - 2), BPLCON1 = s | s << 4.
+gfx_scrollpar:
+        movem.l d1-d2/a1,-(sp)
+        move.l  vp_RasInfo(a2),a1
+        move.w  bm_BytesPerRow(a4),d7
+        muls    ri_RyOffset(a1),d7
+        move.w  bm_BytesPerRow(a4),d6
+        sub.w   4(a0),d6
+        move.w  (a0),d0
+        move.w  ri_RxOffset(a1),d1
+        tst.w   vp_Modes(a2)
+        bmi.s   .sp_hi
+        move.w  d1,d2
+        asr.w   #4,d2
+        add.w   d2,d2
+        ext.l   d2
+        add.l   d2,d7
+        neg.w   d1
+        and.w   #15,d1
+        beq.s   .sp_set
+        subq.w  #8,d0
+        subq.w  #2,d6
+        bra.s   .sp_fine
+.sp_hi:
+        asr.w   #1,d1
+        move.w  d1,d2
+        asr.w   #3,d2
+        add.w   d2,d2
+        ext.l   d2
+        add.l   d2,d7
+        neg.w   d1
+        and.w   #7,d1
+        beq.s   .sp_set
+        subq.w  #8,d0
+        subq.w  #4,d6
+        subq.l  #2,d7
+.sp_fine:
+        move.w  d1,d2
+        lsl.w   #4,d2
+        or.w    d2,d1
+.sp_set:
+        swap    d6
+        move.w  d1,d6
+        swap    d6
+        movem.l (sp)+,d1-d2/a1
+        rts
+
+; gfx_fragmst(vp a0) -> d0 = address of the ViewPort's fragment in the displayed master list, or 0 (not in the
+; active View). Master list: sprites, then one fragment per ViewPort that has one, in View order. Clobbers d1/a1.
+gfx_fragmst:
+        move.l  gb_ActiView(a6),d0
+        beq.s   .fm_ret
+        move.l  d0,a1
+        move.l  v_LOFCprList(a1),d0
+        beq.s   .fm_ret
+        add.l   #GFX_SPRCOP_SIZE,d0
+        move.l  v_ViewPort(a1),a1
+.fm_vp:
+        cmpa.w  #0,a1
+        beq.s   .fm_none
+        cmpa.l  a0,a1
+        beq.s   .fm_ret
+        tst.l   vp_DspIns(a1)
+        beq.s   .fm_nx
+        add.l   #GFX_FRAG_SIZE,d0
+.fm_nx:
+        move.l  vp_Next(a1),a1
+        bra.s   .fm_vp
+.fm_none:
+        moveq   #0,d0
+.fm_ret:
+        rts
+
+; ScrollVPort(vp a0): re-applies RasInfo RxOffset/RyOffset to the ViewPort's DDFSTRT, BPLCON1, modulos and
+; plane pointers, in its fragment and in the displayed list, without MrgCop/LoadView (spec graphics-display
+; §7.3), once the beam is past the ViewPort's first line. VP_HIDE or no fragment: nothing. Deviation: no
+; interlace frame swap (our lists have no SHF frame).
+gfx_ScrollVPort:
+        movem.l d2-d7/a2-a4,-(sp)
+        move.l  a0,a2
+        move.w  vp_Modes(a2),d0
+        and.w   #VP_HIDE,d0
+        bne     .sv_ret
+        move.l  vp_DspIns(a2),d0
+        beq     .sv_ret
+        move.l  d0,a3
+        move.l  vp_RasInfo(a2),a0
+        move.l  ri_BitMap(a0),a4
+        bsr     gfx_vpwin
+        addq.l  #2,a0
+        bsr     gfx_scrollpar
+        move.w  d0,d5                ; d5 = DDFSTRT
+        move.w  vp_DyOffset(a2),d2   ; wait for the line after the ViewPort's first one
+        addq.w  #1,d2
+        move.l  gb_ActiView(a6),d0
+        beq.s   .sv_wait
+        move.l  d0,a0
+        add.w   v_DyOffset(a0),d2
+.sv_wait:
+        bsr     gfx_VBeamPos
+        cmp.w   d2,d0
+        blt.s   .sv_wait
+        moveq   #0,d3
+        move.b  bm_Depth(a4),d3
+        add.w   d3,d3
+        addq.w  #9-1,d3              ; system MOVEs: DIW/DDF (4), BPLCON0-2 and modulos (5), 2 per plane
+        move.l  a3,a0
+.sv_mv:
+        move.w  (a0)+,d0             ; register offset
+        cmp.w   #DDFSTRT-CUSTOM,d0
+        bne.s   .sv_c1
+        move.w  d5,(a0)
+        bra.s   .sv_nx
+.sv_c1:
+        cmp.w   #BPLCON1-CUSTOM,d0
+        bne.s   .sv_md
+        swap    d6
+        move.w  d6,(a0)
+        swap    d6
+        bra.s   .sv_nx
+.sv_md:
+        cmp.w   #BPL1MOD-CUSTOM,d0
+        beq.s   .sv_mod
+        cmp.w   #BPL2MOD-CUSTOM,d0
+        bne.s   .sv_pt
+.sv_mod:
+        move.w  d6,(a0)
+        bra.s   .sv_nx
+.sv_pt:
+        sub.w   #BPL1PTH-CUSTOM,d0
+        bcs.s   .sv_nx
+        cmp.w   #8*4,d0
+        bhs.s   .sv_nx
+        move.w  d0,d1
+        and.w   #~3,d1               ; plane index * 4
+        move.l  bm_Planes(a4,d1.w),d4
+        add.l   d7,d4
+        btst    #1,d0
+        bne.s   .sv_lo
+        swap    d4
+.sv_lo:
+        move.w  d4,(a0)
+.sv_nx:
+        addq.l  #2,a0
+        dbra    d3,.sv_mv
+        move.l  a2,a0
+        bsr     gfx_fragmst
+        tst.l   d0
+        beq.s   .sv_ret
+        move.l  d0,a1                ; the whole fragment into the displayed list
+        move.l  a3,a0
+        move.w  #(GFX_FRAG_SIZE/2)-1,d0
+.sv_cp:
+        move.w  (a0)+,(a1)+
+        dbra    d0,.sv_cp
+.sv_ret:
+        movem.l (sp)+,d2-d7/a2-a4
         rts
 
 ; gfx_ucopemit(a1 = write pointer in the fragment, a2 = ViewPort, a3 = fragment): copies the instructions of
@@ -514,14 +737,12 @@ gfx_LoadRGB4:
         movem.l (sp)+,d2-d5/a2-a3
         rts
 
-; gfx_SetRGB4(vp a0, n d0, r d1, g d2, b d3): ColorTable[n] = 4-bit RGB, and the already generated MOVE COLORn is
-; patched in the ViewPort's fragment and, if it belongs to the displayed view, at its place in the master list.
+; gfx_SetRGB4(vp a0, n d0, r d1, g d2, b d3) -> d0 = 0, or -1 if n > 31 or n is outside the ColorMap (spec
+; graphics-display §3). vp NULL: the COLORn register is written directly. Otherwise ColorTable[n] = 4-bit RGB, and
+; the already generated MOVE COLORn is patched in the ViewPort's fragment and, if it belongs to the displayed view,
+; at its place in the master list.
 gfx_SetRGB4:
-        cmpa.w  #0,a0
-        beq     .sr_ret
-        move.l  vp_ColorMap(a0),a1
-        cmpa.w  #0,a1
-        beq.s   .sr_ret
+        movem.l d2-d3,-(sp)
         and.w   #15,d1
         lsl.w   #4,d1
         and.w   #15,d2
@@ -529,14 +750,26 @@ gfx_SetRGB4:
         lsl.w   #4,d1
         and.w   #15,d3
         or.w    d3,d1                ; d1 = $0RGB
+        cmp.w   #31,d0
+        bgt.s   .sr_bad
+        cmpa.w  #0,a0
+        bne.s   .sr_vp
+        add.w   d0,d0
+        lea     COLOR00,a1
+        move.w  d1,0(a1,d0.w)
+        bra.s   .sr_ok
+.sr_vp:
+        move.l  vp_ColorMap(a0),a1
+        cmpa.w  #0,a1
+        beq.s   .sr_ok
         cmp.w   cm_Count(a1),d0
-        bhs.s   .sr_ret
+        bhs.s   .sr_bad
         move.l  cm_ColorTable(a1),a1
         add.w   d0,d0
         move.w  d1,0(a1,d0.w)
         add.w   #COLOR00-CUSTOM,d0   ; d0 = COLORn register
         move.l  vp_DspIns(a0),d2
-        beq.s   .sr_ret
+        beq.s   .sr_ok
         move.l  d2,a1
         moveq   #GFX_FRAG_WORDS/2-1,d3
 .sr_find:
@@ -544,33 +777,25 @@ gfx_SetRGB4:
         beq.s   .sr_hit
         addq.l  #4,a1
         dbra    d3,.sr_find
-        bra.s   .sr_ret
+        bra.s   .sr_ok
 .sr_hit:
         move.w  d1,2(a1)
         sub.l   d2,a1                ; a1 = position of the MOVE in the fragment
-        move.l  gb_ActiView(a6),d3
-        beq.s   .sr_ret
-        move.l  a0,d2                ; d2 = ViewPort
-        move.l  d3,a0
-        move.l  v_LOFCprList(a0),d3
-        beq.s   .sr_ret
-        add.l   #GFX_SPRCOP_SIZE,d3  ; master list: sprites, then one fragment per ViewPort (that has one), in
-        move.l  v_ViewPort(a0),a0    ; view order
-.sr_vp:
-        cmpa.w  #0,a0
-        beq.s   .sr_ret              ; ViewPort not in the displayed view
-        cmp.l   a0,d2
-        beq.s   .sr_mst
-        tst.l   vp_DspIns(a0)
-        beq.s   .sr_vnx
-        add.l   #GFX_FRAG_SIZE,d3
-.sr_vnx:
-        move.l  vp_Next(a0),a0
-        bra.s   .sr_vp
-.sr_mst:
+        move.l  a1,d3
+        move.w  d1,d2
+        bsr     gfx_fragmst
+        tst.l   d0
+        beq.s   .sr_ok               ; ViewPort not in the displayed view
+        move.l  d0,a1
         add.l   d3,a1
-        move.w  d1,2(a1)
+        move.w  d2,2(a1)
+.sr_ok:
+        moveq   #0,d0
+        bra.s   .sr_ret
+.sr_bad:
+        moveq   #-1,d0
 .sr_ret:
+        movem.l (sp)+,d2-d3
         rts
 
 ; PAL display windows: DIWSTRT, DDFSTRT, DDFSTOP, bytes fetched per row (DIWSTOP: fixed in overscan, otherwise
@@ -597,27 +822,42 @@ gfx_FreeVPortCopLists:
         move.l  vp_UCopIns(a2),d0    ; user list: its CopLists (instructions included) then the header
         beq.s   .fv_ret
         clr.l   vp_UCopIns(a2)
-        move.l  d0,-(sp)
-        move.l  d0,a0
-        move.l  ucl_FirstCopList(a0),a3
-.fv_cl:
-        move.l  a3,d0
-        beq.s   .fv_hdr
-        move.l  cl_CopIns(a3),a1
-        move.w  cl_MaxCount(a3),d0
-        mulu    #CI_SIZEOF,d0
-        jsr     LVO_FREEMEM(a6)
+        move.l  d0,a3
+        move.l  ucl_FirstCopList(a3),a0
+        bsr     gfx_freecl
         move.l  a3,a1
-        move.l  cl_Next(a3),a3
-        moveq   #CL_SIZEOF,d0
-        jsr     LVO_FREEMEM(a6)
-        bra.s   .fv_cl
-.fv_hdr:
-        move.l  (sp)+,a1
         moveq   #UCL_SIZEOF,d0
         jsr     LVO_FREEMEM(a6)
 .fv_ret:
         movem.l (sp)+,a2-a3/a6
+        rts
+
+; FreeCopList(coplist a0): frees each block of the chain (its instructions, then the 34-byte header).
+gfx_FreeCopList:
+        move.l  a6,-(sp)
+        move.l  ($4).w,a6
+        bsr.s   gfx_freecl
+        move.l  (sp)+,a6
+        rts
+; gfx_freecl(coplist a0, a6 = SysBase). Clobbers d0/d1/a0/a1.
+gfx_freecl:
+        move.l  a2,-(sp)
+        move.l  a0,a2
+.fc_lp:
+        move.l  a2,d0
+        beq.s   .fc_ret
+        move.l  cl_CopIns(a2),a1
+        moveq   #0,d0
+        move.w  cl_MaxCount(a2),d0
+        mulu    #CI_SIZEOF,d0
+        jsr     LVO_FREEMEM(a6)
+        move.l  a2,a1
+        move.l  cl_Next(a2),a2
+        moveq   #CL_SIZEOF,d0
+        jsr     LVO_FREEMEM(a6)
+        bra.s   .fc_lp
+.fc_ret:
+        move.l  (sp)+,a2
         rts
 
 ; UCopperListInit(ucl a0, count d0) -> d0 = CopList | 0: CopList of "count" instructions, current and first.
@@ -752,11 +992,10 @@ gfx_sprmoves:
         rts
 
 ; gfx_LoadView(view a1): a1 != 0 -> rewrites the sprite pointers of v_LOFCprList, installs it (COP2LC, behind the
-; COP1LC copinit) + enables
-; Copper/bitplane/sprite DMA + sets
-; gb_ActiView. a1 == 0 (NULL view) -> BLANKS the display: turns off the system's bitplane (RASTER) AND copper
-; DMA, so that the caller (e.g. flt-intro) can set up ITS own COP1LC + bitplanes without our boot copper
-; overwriting them. REQUIRED by flt-intro, which does LoadView(NULL) before taking over the hardware.
+; COP1LC copinit) + enables Copper/bitplane/sprite DMA + sets gb_ActiView. a1 == 0 (NULL view), as on 1.3
+; (graphics-display-v34 §7.1, custom-chips-v34 §2): the DMA stays on, the copinit now jumps to an empty list
+; (no system list overwrites the caller's hardware set-up any more) and the CPU resets the display registers to
+; the system defaults. A program that only loads COP1LC afterwards finds the copper running.
 gfx_LoadView:
         move.l  a1,gb_ActiView(a6)   ; GfxBase.ActiView = view (0 if NULL)
         move.l  a1,d0
@@ -786,8 +1025,25 @@ gfx_LoadView:
         rts
 .lv_null:
         clr.l   gb_SprCop(a6)
-        move.w  #(DMAF_RASTER|DMAF_COPPER|DMAF_SPRITE),DMACON  ; clear (SETCLR=0) bitplane/copper/sprite DMA -> system
-        rts                                        ; display stopped (flt-intro will install its own COP1LC/bitplanes)
+        clr.w   gb_Modes(a6)
+        move.l  gb_copinit(a6),d0
+        beq.s   .lv_nregs
+        addq.l  #GFX_COPINIT_END,d0  ; the copinit's own end-of-list WAIT = an empty list
+        move.l  d0,gb_LOFlist(a6)
+        move.l  d0,COP2LC            ; at once, not only at the next VBlank
+.lv_nregs:
+        move.w  gb_system_bplcon0(a6),d0
+        or.w    #$1200,d0            ; 1 plane + COLOR
+        move.w  d0,BPLCON0
+        move.w  #0,BPLCON1
+        move.w  #GFX_BPLCON2,BPLCON2
+        move.w  #0,BPL1MOD
+        move.w  #0,BPL2MOD
+        move.w  #$2C81,DIWSTRT       ; standard 320x256 window and fetch
+        move.w  #$F4C1,DIWSTOP
+        move.w  #$0038,DDFSTRT
+        move.w  #$00D0,DDFSTOP
+        rts
 
 ; gfx_WaitBlit(): waits until the blitter is idle (poll DMACONR, bit 14 = BBUSY). Double read (A1000 quirk).
 gfx_WaitBlit:
@@ -829,7 +1085,7 @@ gfx_QBlit:
         rts
 
 ; gfx_OwnBlitter(): takes the blitter (gb_BlitSem semaphore: waits until no other task owns it), then waits
-; for it to be idle. The system uses it too (ScrollRaster): a program that holds it holds it for everyone.
+; for it to be idle. ScrollRaster only uses the blitter when nobody holds it (AttemptSemaphore).
 gfx_OwnBlitter:
         move.l  a6,-(sp)
         lea     gb_BlitSem(a6),a0
@@ -946,6 +1202,131 @@ gfx_GetRGB4:
 .gr_bad:
         moveq   #-1,d0
         rts
+
+; InitView(view a1): all 18 bytes cleared, then the standard display origin (spec graphics-display §1.1).
+gfx_InitView:
+        move.l  a1,a0
+        moveq   #v_SIZEOF/2-1,d0
+.iv_clr:
+        clr.w   (a0)+
+        dbra    d0,.iv_clr
+        move.w  #$2C,v_DyOffset(a1)
+        move.w  #$81,v_DxOffset(a1)
+        rts
+
+; InitVPort(vp a0): all 40 bytes cleared, SpritePriorities := $24 (spec §1.2).
+gfx_InitVPort:
+        move.l  a0,a1
+        moveq   #vp_SIZEOF/2-1,d0
+.ip_clr:
+        clr.w   (a1)+
+        dbra    d0,.ip_clr
+        move.b  #$24,vp_SpritePri(a0)
+        rts
+
+; GetColorMap(entries d0) -> d0 = ColorMap | 0. The table starts with the default colours (spec §3); for more than
+; 32 entries the rest is cleared (1.3 copies past its table).
+gfx_GetColorMap:
+        movem.l d2/a2/a6,-(sp)
+        move.l  ($4).w,a6
+        move.w  d0,d2
+        moveq   #GCM_SIZEOF,d0
+        moveq   #MEMF_PUBLIC,d1
+        jsr     LVO_ALLOCMEM(a6)
+        tst.l   d0
+        beq.s   .gc_ret
+        move.l  d0,a2
+        clr.w   (a2)                 ; Flags, Type
+        move.w  d2,cm_Count(a2)
+        moveq   #0,d0
+        move.w  d2,d0
+        add.l   d0,d0
+        move.l  #(MEMF_PUBLIC|MEMF_CLEAR),d1
+        jsr     LVO_ALLOCMEM(a6)
+        move.l  d0,cm_ColorTable(a2)
+        bne.s   .gc_fill
+        move.l  a2,a1
+        moveq   #GCM_SIZEOF,d0
+        jsr     LVO_FREEMEM(a6)
+        moveq   #0,d0
+        bra.s   .gc_ret
+.gc_fill:
+        move.l  d0,a1
+        lea     gfx_defcolors(pc),a0
+        cmp.w   #32,d2
+        bls.s   .gc_n
+        moveq   #32,d2
+.gc_n:
+        subq.w  #1,d2
+        bmi.s   .gc_done
+.gc_cp:
+        move.w  (a0)+,(a1)+
+        dbra    d2,.gc_cp
+.gc_done:
+        move.l  a2,d0
+.gc_ret:
+        movem.l (sp)+,d2/a2/a6
+        rts
+
+; FreeColorMap(colormap a0): frees the table then the structure.
+gfx_FreeColorMap:
+        movem.l a2/a6,-(sp)
+        move.l  ($4).w,a6
+        move.l  a0,a2
+        move.l  cm_ColorTable(a2),a1
+        moveq   #0,d0
+        move.w  cm_Count(a2),d0
+        add.l   d0,d0
+        beq.s   .fm_hdr
+        jsr     LVO_FREEMEM(a6)
+.fm_hdr:
+        move.l  a2,a1
+        moveq   #GCM_SIZEOF,d0
+        jsr     LVO_FREEMEM(a6)
+        movem.l (sp)+,a2/a6
+        rts
+
+; FreeCprList(cprlist a0): our View copper list is a single chip block of GFX_MASTER_SIZE bytes (what MrgCop
+; stores in v_LOFCprList), freed whole. NULL: nothing. Nothing in the View is reset (as on 1.3).
+gfx_FreeCprList:
+        move.l  a0,d0
+        beq.s   .fp_ret
+        move.l  a6,-(sp)
+        move.l  ($4).w,a6
+        move.l  a0,a1
+        move.l  #GFX_MASTER_SIZE,d0
+        jsr     LVO_FREEMEM(a6)
+        move.l  (sp)+,a6
+.fp_ret:
+        rts
+
+; WaitBOVP(vp a0): busy wait until the beam reaches the line after the ViewPort's last one
+; (View.DyOffset + vp.DyOffset + DHeight, at most MaxDisplayRow - 1). Interlace: DHeight is not halved (spec §7.4).
+gfx_WaitBOVP:
+        move.l  d2,-(sp)
+        move.w  vp_DyOffset(a0),d2
+        add.w   vp_DHeight(a0),d2
+        move.l  gb_ActiView(a6),d0
+        beq.s   .wb_cap
+        move.l  d0,a1
+        add.w   v_DyOffset(a1),d2
+.wb_cap:
+        move.w  gb_MaxDisplayRow(a6),d0
+        subq.w  #1,d0
+        cmp.w   d0,d2
+        ble.s   .wb_lp
+        move.w  d0,d2
+.wb_lp:
+        bsr     gfx_VBeamPos
+        cmp.w   d2,d0
+        blt.s   .wb_lp
+        move.l  (sp)+,d2
+        rts
+
+; Default colours of a new ColorMap (observable through GetRGB4, spec graphics-display §3).
+gfx_defcolors:
+        dc.w    $000,$F00,$0F0,$FF0,$00F,$F0F,$0FF,$FFF,$620,$E50,$9F1,$EB0,$55F,$92F,$0F8,$CCC
+        dc.w    $000,$111,$222,$333,$444,$555,$666,$777,$888,$999,$AAA,$BBB,$CCC,$DDD,$EEE,$FFF
 
 ; BltClear(memory a1, size d0, flags d1): zeroes the area. Flag bit 1: d0 = rows (high word) x bytes per
 ; row (low word), otherwise a byte count. The CPU does it: waiting for completion (bit 0) is therefore implied.

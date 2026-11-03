@@ -4,6 +4,8 @@
 > (OpenWindow, border adjustment by gadgets, gadget context, system gadgets,
 > mouse coordinates, IntuiMessage, rendering of a gadget list, window drawing, AddGadget;
 > no ROM address, removed on 2026-10-29). Practical case: `libs/info.library` from `wb133.adf`.
+> §2.5 (SizeWindow and the window's layers) comes from the black-box probe `tests/resize_probe.s`
+> (harness `tests/resize_probe.sh`, FS-UAE A500 PAL, real ROM, pixel readback of the screen BitMap).
 >
 > **Legend**: **[O]** observed · **[D]** deduced · **[S]** assumed. **No instruction sequence is reproduced**: only calculation rules,
 > fields of public structures (`intuition.h` 1.3) and library calls.
@@ -148,6 +150,79 @@ Computed after the layers, for **all** windows:
 For a BACKDROP window on a screen whose title bar is displayed, intuition does
 MoveLayerInFrontOf(screen's BarLayer, window's layer).
 
+### 2.5 SizeWindow and the window's layers [O]
+
+Probe setup: windows on the Workbench screen (640 wide, 2 planes) at (100,30), 200×80, no title, no
+gadget except the sizing gadget (`WINDOWSIZING`), IDCMPFlags = NEWSIZE | REFRESHWINDOW ($6). Borders
+measured: BorderLeft 4, BorderTop 2, BorderRight 18, BorderBottom 2. Pattern = 8×8 checker of pens 1/2
+relative to the origin of the drawn RastPort. Pixels read from the screen BitMap about 2 s after the
+call (50 × Delay(2) while draining the UserPort), **before** any BeginRefresh. Coordinates below are
+window-relative.
+
+**Messages.**
+- **No NEWSIZE is ever posted by SizeWindow()** in these runs: SIMPLE, SMART, SUPER, GZZ SUPER windows,
+  IDCMP NEWSIZE|REFRESHWINDOW, and a control window with IDCMP = NEWSIZE alone (nothing received in
+  4 s), although the size is applied (`Width`/`Height` updated). This contradicts
+  `intuition-input-menus-v34.md` §2.4 ("NEWSIZE at the end of each SizeWindow"); NEWSIZE after a
+  drag of the sizing gadget by the user was not tested here.
+- REFRESHWINDOW: **one** message after each SizeWindow of a window whose (single) layer ends up with
+  LAYERREFRESH: SIMPLE (grow and shrink), SMART (grow +16,+8), non-GZZ SUPER (grow). **None** for the
+  GZZ SUPER window. None at OpenWindow (SIMPLE: the layer has LAYERREFRESH from its creation, Flags
+  `$0081`, empty DamageList, but no message).
+
+**SIMPLE_REFRESH, non-GZZ** (single layer, Flags `$0081` after OpenWindow):
+- SizeWindow(+40,+20) → 240×100: the **whole window is 0** (old interior included) except the frame,
+  which intuition has redrawn completely at the new size (top and bottom lines, 2-pixel left line,
+  right band with its line, sizing gadget) before REFRESHWINDOW. Layer Flags `$0081`, DamageList =
+  one rectangle `(0,0)-(239,99)` (whole layer). Matches layers `layers-v34.md` §5.7 (SIMPLE: nothing
+  survives).
+- BeginRefresh + EndRefresh(TRUE) with no drawing: Flags `$0001`, DamageList empty, pixels unchanged.
+- Interior refilled, then SizeWindow(−60,−30) → 180×70: interior 0 again, frame complete at the new
+  size. Flags `$0081`. DamageList bounds `(0,0)-(239,99)` = the **old** size, rectangles: whole new
+  window `(0,0)-(179,69)`, old right band `(222,1)-(239,99)`, new right band extended to the old height
+  `(162,70)-(179,99)`, old bottom band `(0,98)-(161,99)` and `(180,98)-(221,99)`, new bottom band
+  extended to the old width `(180,68)-(221,69)`, pixel `(239,0)`. These bands of the old and new frame
+  are not produced by layers for a SIMPLE layer (whole new layer only), so intuition adds them [D].
+  Implementations: the DamageList may extend beyond the shrunken layer.
+
+**GIMMEZEROZERO | SUPER_BITMAP** (`NewWindow.BitMap` = InitBitMap'ed 320×200×2, filled by the CPU):
+- `RPort->Layer` = `WLayer` = inner layer; its **`SuperBitMap` = the supplied BitMap** (same pointer);
+  inner Flags **`$0004`** (SUPER alone); inner bounds = window rectangle minus borders, 178×76.
+- `BorderRPort->Layer` = outer layer, Flags **`$0081`** after OpenWindow (SIMPLE + LAYERREFRESH).
+- After OpenWindow the interior shows the SuperBitMap from its (0,0) (inner layer origin ↔ SuperBitMap
+  (0,0)).
+- SizeWindow(+40,+20): **no message at all**; every interior pixel, newly visible ones included
+  (218×96), equals the SuperBitMap; inner Flags `$0004`, DamageList empty; outer Flags `$0001`, empty
+  DamageList (frame repaired by intuition itself, complete); the SuperBitMap is unchanged (sampled
+  over (0,0)-(241,101)).
+
+**SUPER_BITMAP without GIMMEZEROZERO** (single layer = whole window):
+- Layer Flags `$0004`, `SuperBitMap` = supplied BitMap, BorderRPort = NULL. Layer origin = window origin
+  ↔ SuperBitMap (0,0): the frame is drawn over the SuperBitMap content (border bands 0, lines pen 1).
+- Right after OpenWindow the **SuperBitMap already contains the frame** (rows 0-79, columns 0-199
+  equal to the screen); the rest of the SuperBitMap is unchanged.
+- SizeWindow(+40,+20) → 240×100: one REFRESHWINDOW; Flags **`$0084`** (LAYERREFRESH set although layers
+  gives no damage to a SUPER layer, `layers-v34.md` §5.7); DamageList bounds `(0,0)-(239,99)`,
+  rectangles: old right band `(182,1)-(199,79)`, new right band `(222,1)-(239,79)`, old bottom band
+  `(0,78)-(181,79)`, new bottom band `(0,98)-(182,99)`, pixels `(199,0)` and `(239,0)`, new sizing gadget
+  `(224,91)-(239,99)` — only frame pieces, added by intuition [D].
+- Screen: old interior kept; newly exposed pixels (columns 200-239, rows 80-99) come from the
+  SuperBitMap; inside the DamageList everything is 0 except the new frame drawn there. The new frame is
+  drawn **only inside these rectangles**: the left border on rows 80-97, the right band on rows 80-90,
+  the top line on columns 200-238 and the bottom band on columns 183-223 are **not drawn** and show the
+  SuperBitMap pattern. The old border bands inside the new interior are 0.
+- The SuperBitMap after the resize is **not** equal to the screen: it holds frame pixels that the
+  screen does not show (complete top line 0-239; left band columns 0-3 = 0 on rows 1-77 and 80-97,
+  i.e. without its line; right band 222-239 = 0 with its line on rows 1-77 and without line on rows
+  80-90; new sizing gadget on rows 91-99), plus the old border bands as 0.
+- BeginRefresh + EndRefresh(TRUE) without drawing: Flags `$0004`, DamageList empty, screen and
+  SuperBitMap unchanged (EndRefresh repairs nothing).
+- Consequence for an implementation: a non-GZZ SUPER_BITMAP window is left with an incomplete frame
+  after SizeWindow on 1.3; the application is expected to redraw the frame (or use GZZ). How the frame
+  pixels reach the SuperBitMap without reaching the screen is not established.
+
+**SMART_REFRESH, non-GZZ** (control): SizeWindow(+16,+8) → one REFRESHWINDOW, no NEWSIZE.
+
 ---
 
 ## 3. Mouse coordinates
@@ -234,7 +309,7 @@ a count `n`. It works in two passes.
       GADGIMAGE, otherwise **DrawBorder** of GadgetRender (nothing if the pointer is NULL);
    2. its **GadgetText** (PrintIText);
    3. for a STRGADGET, its text;
-   4. if **GADGDISABLED**, the ghosting pattern over its box.
+   4. if **GADGDISABLED**, the ghosting pattern over its box (exact rule in §6.4).
 
    So there is **no** "all images, then all texts" pass: each gadget is
    finished before moving to the previous one. **The first gadget of the list is drawn last,
@@ -257,6 +332,14 @@ of drawing.
 | Screen title bar | screen gadgets | −1 |
 | One-off refresh (window activation or deactivation, frame gadgets) | one gadget | 1 |
 | **AddGadget**(win, gad, pos) (−42) | — | **draws nothing**: simple insertion at position `pos` (−1 = end), the gadget is only displayed at the next Refresh |
+| **OffGadget**(gad, win, req) (−174) / **OnGadget**(gad, win, req) (−186) | `gad` | **−2**: set / clear GADGDISABLED, then exactly the RefreshGadgets(gad, win) path (§6.4) |
+
+Requester gadgets (GTYP REQGADGET), for every caller of the routine [O, ROM reading, not probed]: the
+requester is the one of the window's requester list whose gadget list contains `gad`; if it is not
+displayed (no ReqLayer) nothing is drawn. If that requester has Flags bit $0002 (PREDRAWN in the
+public headers) nothing is drawn either. With a count of −2 the range starts at the requester's
+**first** gadget (`ReqGadget`), not at `gad`: RefreshGadgets/OnGadget/OffGadget on any requester
+gadget redraw the whole requester list.
 
 ### 6.3 Application to the Info window (info.library) [O]
 
@@ -284,6 +367,80 @@ of drawing.
 - An implementation that drew forwards (first → last) would cover SAVE and QUIT
   with the filler.
 
+### 6.4 Ghosting of GADGDISABLED gadgets
+
+Sources: ROM reading of the gadget list routine, of the gadget environment set-up and of
+OnGadget/OffGadget [O]; black-box check on SysInfo 4.4 and on Workbench 1.3.3 menus, Amiberry,
+real ROM 34.5, screen pixels read from the emulator picture [O, screenshot].
+
+**What is drawn** [O]. In step 4 of the rendering pass (§6.1), after the gadget's rendering, its
+GadgetText and (STRGADGET) its text, a gadget whose Flags has **GADGDISABLED ($0100)** gets a
+patterned **RectFill** over its box. It applies to **every gadget type** (boolean, proportional,
+string) and to every domain (window, GZZ frame, requester, screen gadgets): the test is the flag
+only.
+
+- **Rectangle**: the gadget's box as computed for the domain in §4.1, i.e. after GRELRIGHT,
+  GRELBOTTOM, GRELWIDTH and GRELHEIGHT; inclusive corners (Left, Top) – (Left + Width − 1,
+  Top + Height − 1), in the coordinates of the domain's rendering layer (§4.2; for a requester
+  gadget its requester's layer, for a screen gadget the screen's title-bar layer). Nothing is drawn
+  if the resolved Width or Height is ≤ 0. The fill does **not** extend to a GadgetText, a Border or an
+  Image that lies outside the box; inside the box the dots are laid over whatever the rendering drew.
+- **Pattern**: AreaPtrn = 4 words **$4444, $1111, $4444, $1111**, AreaPtSz = **2** (4 lines; the
+  visible period is 2 lines). One pixel out of four on every line: on pattern lines 0 and 2 the
+  pixels with x mod 4 = 1, on lines 1 and 3 those with x mod 4 = 3 (diagonal dot grid).
+- **Pens**: APen = the **BlockPen of the gadget environment**, BPen = 0, DrawMode = **JAM1** (only
+  the dots are written; the other pixels keep what the gadget rendering left). The environment's
+  BlockPen is `Window->BlockPen` for window gadgets **and for requester gadgets** (not the
+  requester's BackFill), and `Screen->BlockPen` for screen gadgets (SCRGADGET).
+- **RastPort**: the list is drawn in a copy of the domain's RastPort held in IntuitionBase (layer of
+  §4.2), so AreaPtrn/AreaPtSz/pens set for the ghosting are not left in `Window->RPort`. While the
+  list is drawn, the layer is locked, its clip region is removed (InstallClipRegion NULL) and its
+  Scroll_X/Scroll_Y are forced to 0; all three are restored afterwards [O].
+- **Pattern origin** [O, ROM reading of graphics BltPattern]: the pattern is aligned on the
+  **coordinates of the RastPort that is drawn into**, in both directions: the pixel at RastPort
+  coordinates (x, y) (layer coordinates; for gadgets the scroll is 0, see above, so the origin is
+  the layer's top-left corner) uses word `y mod 4`, bit `15 − (x mod 16)`.
+  In a layer, graphics shifts the pattern line by the layer's vertical offset and rotates the pattern
+  word by its horizontal offset, so the grid follows the window, not the screen. (The SysInfo check
+  below has its window at (0,0), so it confirms the phase but does not discriminate layer from
+  screen origin; the layer case is ROM reading only, for the visible ClipRects; obscured
+  ClipRects and SuperBitMap layers are assumed to behave the same [S].)
+
+**When it is drawn** [O].
+- At every rendering of the list (§6.2): OpenWindow, RefreshGadgets, RefreshWindowFrame/frame
+  repair, requester drawing, screen title bar, one-off frame-gadget refreshes. A gadget whose
+  GADGDISABLED is set by the application **before** OpenWindow (in the NewWindow list) is ghosted
+  at the initial drawing.
+- **OffGadget**(gad, win, req): sets GADGDISABLED, then redraws from `gad` to the **end** of the list
+  (count −2: not just this gadget). The `req` argument is not used: for a requester gadget the
+  requester is found from the gadget (see the note under §6.2, which also makes it redraw the whole
+  requester list). The redraw does **not** erase first: the rendering is drawn again over what is
+  there, then the dots.
+- **OnGadget**(gad, win, req): clears GADGDISABLED, then the same redraw (count −2), still **without
+  erasing the box**. The dots disappear only where the gadget rendering itself overwrites them: a
+  full Image or a JAM2 text covers them, a Border (lines only) does not, so the dots stay between the
+  lines of a Border gadget until the application clears the area and refreshes [D from the absence
+  of any erase step in the path; not probed].
+- **SELECTED disabled gadget**: the highlight pass (§6.1, step 2) does not test GADGDISABLED; a
+  SELECTED gadget is highlighted (e.g. GADGHCOMP complements its box) **after** being ghosted, so the
+  dots are complemented with the rest.
+- **Hit test**: when the button goes down over a disabled gadget, the search stops on it and reports
+  no gadget (a gadget behind it in the list is not reached).
+
+**SysInfo 4.4 on the real ROM** [O, screenshot]. On a 68000, the main window (BORDERLESS backdrop
+window at (0,0), 640×256 hires screen, Window BlockPen = 1) has six 64×10 boolean gadgets
+(GADGHIMAGE, RELVERIFY) at (420/489/558, 176/188): ICACHE, DCACHE, IBURST, DBURST, CBACK, ALL. In
+the live window their Flags are $0102 (GADGDISABLED set); in the program file the same structures
+have $0002, and neither OffGadget nor OnGadget is called while SysInfo starts (hardware
+breakpoints on both never fired, while the ghosting fill fired): SysInfo sets GADGDISABLED itself
+before the gadgets are first drawn, and the ghosting comes from the ordinary list rendering. On
+screen the six buttons show a regular grid of single pen-1 dots (white in SysInfo's palette) over
+their grey/white/black imagery: every second line has a dot every 4 pixels, the lines between have
+the same spacing shifted by 2 pixels; e.g. on line 177 dots at x = 423, 427, … 483 and on line 178 at
+x = 421, 425, …, i.e. x mod 4 = 3 on odd lines and 1 on even lines, as the rule above gives for a
+layer at (0,0). No dot appears outside x 420..483 / y 176..185 of the ICACHE box. The other buttons
+(QUIT, MEMORY, …: Flags $0002) have no dots.
+
 ---
 
 ## 7. Test vectors
@@ -296,6 +453,12 @@ of drawing.
 | Non-GZZ gadget in a GZZ, LeftEdge 0 TopEdge 0 | drawn at the top-left corner of the inner area |
 | Overlapping list A→B→C, RefreshGadgets(A) | drawing order C, B, A: A visible on top |
 | AddGadget(win, g, −1) alone | nothing is drawn until a Refresh takes place |
+| SizeWindow(±dx,±dy) on any window, IDCMP NEWSIZE\|REFRESHWINDOW | no NEWSIZE; one REFRESHWINDOW unless GZZ SUPER (§2.5) |
+| SIMPLE non-GZZ 200×80, interior filled, SizeWindow(+40,+20) | whole window 0 except a complete new frame; Flags $0081; damage (0,0)-(239,99) |
+| GZZ SUPER (NewWindow.BitMap 320×200×2), SizeWindow(+40,+20) | inner SuperBitMap = BitMap, inner Flags $0004, outer $0081→$0001; whole interior = SuperBitMap; no message |
+| non-GZZ SUPER, SizeWindow(+40,+20) | Flags $0084, REFRESHWINDOW; frame redrawn only inside the damaged frame bands (§2.5) |
+| SysInfo 4.4 on a 68000, main window at (0,0), BlockPen 1 | ICACHE box (420,176) 64×10, Flags $0102: pen-1 dots at x mod 4 = 3 on odd lines, x mod 4 = 1 on even lines, only inside x 420..483, y 176..185 (§6.4) |
+| Disabled gadget, then OnGadget, Border rendering only | flag cleared, gadget and the rest of the list redrawn, box not erased: dots between the border lines remain [D] |
 
 ---
 
@@ -310,3 +473,9 @@ of drawing.
   its public calls (AddGadget −1, RefreshGadgets(FirstGadget)), without copied code.
 - [x] **Correction of 2026-10-29**: removed the 13 ROM routine addresses from the header,
   replaced by the list of functions studied; body unchanged.
+- [x] §6.4 (2026-11-02): ghosting described as a rule (pattern words, pens, rectangle, alignment, callers);
+  public structure fields and library calls only (RectFill, InstallClipRegion, OnGadget/OffGadget LVOs); no
+  instruction sequence and no ROM address. SysInfo figures are its own gadget data read from the live
+  window and screen pixels from the emulator picture.
+- [x] §2.5 (2026-11-01): black-box readback only (pixels, Flags, DamageList, IDCMP classes) from the
+  author probe `tests/resize_probe.s`; no ROM code read for it.
